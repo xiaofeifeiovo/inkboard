@@ -9,6 +9,8 @@ enum MainMenu {
         main.addSubmenu("Inkboard") { menu in
             menu.addItem(withTitle: "关于 Inkboard", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
             menu.addItem(.separator())
+            menu.addItem(withTitle: "设置…", action: #selector(AppDelegate.showSettings(_:)), keyEquivalent: ",")
+            menu.addItem(.separator())
             menu.addItem(withTitle: "隐藏 Inkboard", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
             menu.addItem(withTitle: "隐藏其他", action: #selector(NSApplication.hideOtherApplications(_:)), keyEquivalent: "h")
                 .keyEquivalentModifierMask = [.command, .option]
@@ -42,8 +44,6 @@ enum MainMenu {
             menu.addItem(.separator())
             menu.addItem(withTitle: "导出 PNG…", action: #selector(MainWindowController.exportPNG(_:)), keyEquivalent: "e")
                 .keyEquivalentModifierMask = [.command, .shift]
-            menu.addItem(withTitle: "转写为 Markdown（AI）…", action: #selector(MainWindowController.transcribeToMarkdown(_:)), keyEquivalent: "m")
-                .keyEquivalentModifierMask = [.command, .shift]
             menu.addItem(.separator())
             menu.addItem(withTitle: "清空画布", action: #selector(MainWindowController.clearBoard(_:)), keyEquivalent: "")
         }
@@ -75,10 +75,21 @@ enum MainMenu {
             menu.addItem(withTitle: "按住空格拖动可平移画布", action: nil, keyEquivalent: "").isEnabled = false
         }
 
+        main.addSubmenu("转换") { menu in
+            menu.addItem(withTitle: "局部转换：公式 → LaTeX", action: #selector(MainWindowController.toggleFormulaCapture(_:)), keyEquivalent: "l")
+                .keyEquivalentModifierMask = [.command, .shift]
+            menu.addItem(withTitle: "全局转换：画板 → Markdown", action: #selector(MainWindowController.convertDocument(_:)), keyEquivalent: "m")
+                .keyEquivalentModifierMask = [.command, .shift]
+            menu.addItem(.separator())
+            menu.addItem(withTitle: "AI 设置…", action: #selector(AppDelegate.showSettings(_:)), keyEquivalent: "")
+        }
+
         main.addSubmenu("显示") { menu in
             menu.addItem(withTitle: "放大", action: #selector(MainWindowController.zoomIn(_:)), keyEquivalent: "=")
             menu.addItem(withTitle: "缩小", action: #selector(MainWindowController.zoomOut(_:)), keyEquivalent: "-")
             menu.addItem(withTitle: "实际大小", action: #selector(MainWindowController.actualSize(_:)), keyEquivalent: "0")
+            menu.addItem(.separator())
+            menu.addItem(withTitle: "显示点格", action: #selector(AppDelegate.toggleDotGrid(_:)), keyEquivalent: "")
             menu.addItem(.separator())
             menu.addItem(withTitle: "进入全屏幕", action: #selector(NSWindow.toggleFullScreen(_:)), keyEquivalent: "f")
                 .keyEquivalentModifierMask = [.command, .control]

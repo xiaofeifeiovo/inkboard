@@ -13,10 +13,23 @@ final class CanvasView: NSView {
     /// Eraser radius in screen points; it stays the same size on screen at any zoom.
     private static let eraserScreenRadius: CGFloat = 9
 
+    /// Dot grid behind the ink (显示 → 显示点格). App-wide and remembered; on screen only —
+    /// exports and AI images are rendered by InkRenderer and never have it.
+    static var showsDotGrid: Bool = UserDefaults.standard.object(forKey: dotGridKey) as? Bool ?? true {
+        didSet {
+            guard showsDotGrid != oldValue else { return }
+            UserDefaults.standard.set(showsDotGrid, forKey: dotGridKey)
+            NotificationCenter.default.post(name: dotGridDidChange, object: nil)
+        }
+    }
+    private static let dotGridKey = "canvas.showsDotGrid"
+    private static let dotGridDidChange = Notification.Name("InkboardDotGridDidChange")
+
     // MARK: - Public state
 
     var tool: Tool = .pen {
         didSet {
+            isCapturingFormula = false   // picking any tool (even the current one) ends formula capture
             guard tool != oldValue else { return }
             if tool != .lasso { clearSelection() }
             hoverGuideInvalidate()
@@ -29,6 +42,31 @@ final class CanvasView: NSView {
     var onToolChange: ((Tool) -> Void)?
     /// Called after every committed edit (and undo/redo) — used for autosave.
     var onContentChange: (() -> Void)?
+
+    /// 局部转换 mode: dragging draws a box instead of using the tool; each finished box is
+    /// reported through `onFormulaCapture`. The box is only an overlay and never touches the ink.
+    var isCapturingFormula = false {
+        didSet {
+            guard isCapturingFormula != oldValue else { return }
+            if isCapturingFormula {
+                clearSelection()
+            } else {
+                if case .capture = gesture { gesture = nil }
+                captureRect = nil
+                captureBusy = false
+            }
+            needsDisplay = true
+            updateCursor()
+            onCaptureModeChange?(isCapturingFormula)
+        }
+    }
+    /// The box being converted is drawn highlighted.
+    var captureBusy = false {
+        didSet { if captureBusy != oldValue { invalidateCaptureBox() } }
+    }
+    private(set) var captureRect: CGRect?
+    var onFormulaCapture: ((CGRect) -> Void)?
+    var onCaptureModeChange: ((Bool) -> Void)?
 
     private(set) var strokes: [Stroke] = []
     private(set) var selection: Set<UUID> = [] {
@@ -83,6 +121,7 @@ final class CanvasView: NSView {
         case move(MoveSession)
         case insertSpace(SpaceSession)
         case pan(lastWindowPoint: NSPoint)
+        case capture(start: CGPoint, current: CGPoint)
     }
 
     private var gesture: Gesture?
@@ -93,6 +132,7 @@ final class CanvasView: NSView {
     private var mouseLocation: CGPoint?
     private var proximityMonitor: Any?
     private var resignKeyObserver: NSObjectProtocol?
+    private var dotGridObserver: NSObjectProtocol?
 
     // MARK: - NSView
 
@@ -121,6 +161,14 @@ final class CanvasView: NSView {
             self?.spaceKeyDown = false
         }
 
+        if dotGridObserver == nil {
+            dotGridObserver = NotificationCenter.default.addObserver(
+                forName: Self.dotGridDidChange, object: nil, queue: .main
+            ) { [weak self] _ in
+                self?.needsDisplay = true
+            }
+        }
+
         // Flipping a Wacom-style pen switches to the eraser while the eraser end is near the tablet.
         if proximityMonitor == nil {
             proximityMonitor = NSEvent.addLocalMonitorForEvents(matching: .tabletProximity) { [weak self] event in
@@ -133,6 +181,7 @@ final class CanvasView: NSView {
     deinit {
         if let monitor = proximityMonitor { NSEvent.removeMonitor(monitor) }
         if let observer = resignKeyObserver { NotificationCenter.default.removeObserver(observer) }
+        if let observer = dotGridObserver { NotificationCenter.default.removeObserver(observer) }
     }
 
     override func updateTrackingAreas() {
@@ -195,6 +244,12 @@ final class CanvasView: NSView {
         if spaceKeyDown {
             gesture = .pan(lastWindowPoint: event.locationInWindow)
             NSCursor.closedHand.set()
+            return
+        }
+
+        if isCapturingFormula {
+            invalidateCaptureBox()
+            gesture = .capture(start: p, current: p)
             return
         }
 
@@ -276,6 +331,12 @@ final class CanvasView: NSView {
         case .pan(let lastWindowPoint):
             pan(by: event.locationInWindow, from: lastWindowPoint)
             self.gesture = .pan(lastWindowPoint: event.locationInWindow)
+
+        case .capture(let start, _):
+            invalidateCaptureBox()
+            self.gesture = .capture(start: start, current: p)
+            invalidateCaptureBox()
+            autoscroll(with: event)
         }
     }
 
@@ -324,6 +385,16 @@ final class CanvasView: NSView {
 
         case .pan:
             break
+
+        case .capture(let start, let end):
+            let box = Self.rect(from: start, to: end)
+            setNeedsDisplay(box.insetBy(dx: -4 / magnification, dy: -4 / magnification))
+            // A click (no real box) keeps the previous box.
+            guard min(box.width, box.height) * magnification >= 6 else { invalidateCaptureBox(); break }
+            invalidateCaptureBox()
+            captureRect = box
+            invalidateCaptureBox()
+            onFormulaCapture?(box)
         }
         updateCursor()
     }
@@ -434,7 +505,7 @@ final class CanvasView: NSView {
             deleteSelection()
             return
         case 53: // escape
-            clearSelection()
+            if isCapturingFormula { isCapturingFormula = false } else { clearSelection() }
             return
         default:
             break
@@ -516,7 +587,7 @@ final class CanvasView: NSView {
 
         ctx.setFillColor(CGColor(gray: 1, alpha: 1))
         ctx.fill(dirtyRect)
-        drawDotGrid(in: dirtyRect, ctx: ctx, magnification: mag)
+        if Self.showsDotGrid { drawDotGrid(in: dirtyRect, ctx: ctx, magnification: mag) }
 
         var moving: Set<UUID> = []
         var movingOffset = CGVector.zero
@@ -586,8 +657,17 @@ final class CanvasView: NSView {
             ctx.setLineDash(phase: 0, lengths: [])
         }
 
+        // 局部转换 box: the one being dragged, else the last one.
+        if isCapturingFormula {
+            if case .capture(let start, let end) = gesture {
+                drawCaptureBox(Self.rect(from: start, to: end), busy: false, dashed: true, ctx: ctx, accent: accent, magnification: mag)
+            } else if let box = captureRect {
+                drawCaptureBox(box, busy: captureBusy, dashed: false, ctx: ctx, accent: accent, magnification: mag)
+            }
+        }
+
         // Insert-space hover guide.
-        if gesture == nil, activeTool == .insertSpace, let hover = mouseLocation {
+        if gesture == nil, !isCapturingFormula, activeTool == .insertSpace, let hover = mouseLocation {
             drawHorizontalLine(at: hover.y, ctx: ctx, color: accent, width: 1 / mag, dashed: [6 / mag, 4 / mag])
         }
     }
@@ -636,6 +716,30 @@ final class CanvasView: NSView {
         ctx.restoreGState()
     }
 
+    private func drawCaptureBox(_ box: CGRect, busy: Bool, dashed: Bool, ctx: CGContext, accent: CGColor, magnification mag: CGFloat) {
+        ctx.saveGState()
+        ctx.setFillColor(accent.copy(alpha: busy ? 0.14 : 0.05) ?? accent)
+        ctx.fill(box)
+        ctx.setStrokeColor(accent)
+        ctx.setLineWidth(1.5 / mag)
+        if dashed { ctx.setLineDash(phase: 0, lengths: [5 / mag, 4 / mag]) }
+        ctx.stroke(box)
+        ctx.restoreGState()
+    }
+
+    /// Marks the area of the current capture box (dragged or settled) for redraw.
+    private func invalidateCaptureBox() {
+        var box = captureRect ?? .null
+        if case .capture(let start, let end) = gesture { box = box.union(Self.rect(from: start, to: end)) }
+        guard !box.isNull else { return }
+        let pad = 4 / magnification
+        setNeedsDisplay(box.insetBy(dx: -pad, dy: -pad))
+    }
+
+    private static func rect(from a: CGPoint, to b: CGPoint) -> CGRect {
+        CGRect(x: min(a.x, b.x), y: min(a.y, b.y), width: abs(a.x - b.x), height: abs(a.y - b.y))
+    }
+
     private func hoverGuideInvalidate() {
         guard let y = mouseLocation?.y else { return }
         let visible = visibleRect
@@ -670,6 +774,7 @@ final class CanvasView: NSView {
 
     private func cursor(at point: CGPoint?) -> NSCursor {
         if spaceKeyDown { return .openHand }
+        if isCapturingFormula { return .crosshair }
         switch activeTool {
         case .pen:
             return Self.penCursor

@@ -4,8 +4,9 @@ import InkboardCore
 /// Documents (windows, saving, Open Recent, restoring windows at launch) are run by
 /// NSDocumentController using BoardDocument, as declared in Support/Info.plist.
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    /// Replace with a real implementation to enable AI → Markdown (see Transcription.swift).
-    static let transcriber: HandwritingTranscriber = UnconfiguredTranscriber()
+    /// AI conversions go to the ACP agent chosen in 设置 (Antigravity's `agy acp` by default).
+    /// Settings are re-read for every request.
+    static let transcriber = ACPTranscriber { try AISettings.current.transcriberSettings() }
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         // Set before launch finishes so NSDocumentController finds the Open Recent menu.
@@ -22,9 +23,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    func applicationWillTerminate(_ notification: Notification) {
+        Self.transcriber.shutdown()
+    }
+
+    @objc func showSettings(_ sender: Any?) {
+        SettingsWindowController.shared.showWindow(sender)
+    }
+
+    /// 显示 → 显示点格 (applies to every window).
+    @objc func toggleDotGrid(_ sender: Any?) {
+        CanvasView.showsDotGrid.toggle()
+    }
+
     /// Called at launch when no window was restored, and when the Dock icon is clicked with no windows open.
     func applicationShouldOpenUntitledFile(_ sender: NSApplication) -> Bool {
         !LegacyBoard.importIfPresent()
+    }
+}
+
+extension AppDelegate: NSMenuItemValidation {
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.action == #selector(toggleDotGrid(_:)) {
+            menuItem.state = CanvasView.showsDotGrid ? .on : .off
+        }
+        return true
     }
 }
 

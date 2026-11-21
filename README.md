@@ -25,6 +25,7 @@ scripts/build.sh check      # 编译 + 跑核心逻辑自检，并输出 build/s
 - 缩放：触控板双指捏合，或 ⌘= / ⌘- / ⌘0
 - 平移：双指滚动，或按住空格拖动
 - 画布向右、向下自动扩展
+- 显示 → 显示点格：开关点格背景（所有窗口共用，会记住）。导出的 PNG 和发给 AI 的图片始终是纯白底，不带点格
 - 文件 → 导出 PNG（有选区时只导出选区）
 
 ### 文件
@@ -55,17 +56,28 @@ scripts/build.sh check      # 编译 + 跑核心逻辑自检，并输出 build/s
 
 笔迹处理：先用向心 Catmull-Rom 样条平滑，再按约 1 屏幕像素的间距重新采样。每个采样点按压力换算成半径，笔画由圆和相邻圆之间的外切梯形拼成，最后一次性填充，所以急转弯处也不会出现破洞。
 
-## AI 转写接口（已预留）
+## AI 转换
 
-`Sources/InkboardCore/Transcription.swift`：
+通过 [ACP（Agent Client Protocol）](https://agentclientprotocol.com) 调用本机的 AI agent，默认是 Antigravity 的 `agy acp`（需要先在终端用 `agy` 登录）。
 
-```swift
-public protocol HandwritingTranscriber {
-    func transcribeToMarkdown(_ request: TranscriptionRequest) async throws -> String
-}
-```
+| 功能 | 入口 | 说明 |
+|---|---|---|
+| 局部转换 | 工具栏「局部转换」，或「转换」菜单 ⇧⌘L | 在画布上拖出一个方框框住公式，松开后自动识别，LaTeX 代码复制到剪贴板。可以接着框下一个；Esc 或切换工具退出 |
+| 全局转换 | 工具栏「全局转换」，或「转换」菜单 ⇧⌘M | 把整个画板切成若干页图片发给 AI，整理成 Markdown，存为与 `.inkboard` 同一文件夹下的同名 `.md`。未存储的文稿会先要求存储；同名文件已存在时询问是否替换 |
 
-`TranscriptionRequest` 里带着白底黑字的 `pngData`，以及原始笔画（坐标和压力）。接入方法：实现这个协议（比如把 PNG 发给视觉模型），然后在 `AppDelegate.swift` 里把 `UnconfiguredTranscriber()` 换成你的实现。工具栏的 ✨ 按钮和「文件 → 转写为 Markdown」已经接好：转写当前选区，没有选区时转写整个画布，结果保存为 `.md`。
+切页规则：按行把笔迹分组，从上往下装进接近 A4 比例的页面，切线落在两行之间，不会把一行字切开；大片空白会跳过。
+
+**设置**（Inkboard → 设置…，⌘,）：
+
+- agent 命令和参数。默认 `agy` + `acp`；也可以换成其他支持 ACP 的 agent，例如 `gemini` + `--experimental-acp`。命令可以写名字（会在 `~/.local/bin`、`/opt/homebrew/bin` 等位置查找）或完整路径。
+- 局部转换和全局转换分别设置模型、思考档位和提示词。模型列表是从 agent 读取的，点「读取模型列表」刷新。
+- 全局转换时单张图片的最长边（像素）。
+
+说明：
+
+- agent 进程在第一次用到时启动，之后一直保留，每次转换开一个新会话。冷启动后第一次请求比较慢（十几秒），之后公式识别一般在几秒内完成。
+- Inkboard 不给 agent 文件读写和终端权限，它请求权限时一律拒绝；`.md` 文件由 Inkboard 自己写。
+- agy 是编程 agent，每次请求都会附带它自己约 1 万 token 的系统提示，消耗的是你账号的额度。
 
 ## 代码结构
 
@@ -77,11 +89,16 @@ Sources/InkboardCore/     纯逻辑，不依赖 AppKit
   InkOps.swift            擦除、套索、平移、插入空间
   InkRenderer.swift       渲染与导出 PNG
   BoardStore.swift        JSON 存储
-  Transcription.swift     AI 转写接口
+  ACP.swift               ACP 客户端：启动 agent、JSON-RPC、会话与模型设置
+  Transcription.swift     AI 转换接口与 ACP 实现、结果清理
+  PageSlicer.swift        全局转换的切页与渲染
 Sources/Inkboard/         macOS 应用
   BoardDocument.swift     .inkboard 文稿：读写、自动存储、复原
   CanvasView.swift        画布：输入、手势、绘制、撤销
-  MainWindowController.swift  文稿窗口、工具栏、导出
+  MainWindowController.swift  文稿窗口、工具栏、导出、局部 / 全局转换
+  AISettings.swift        AI 设置（UserDefaults）
+  SettingsWindowController.swift  设置窗口
+  StatusBanner.swift      画布上方的状态提示条
   AppDelegate.swift       启动；旧版画板迁移
   MainMenu.swift / Tool.swift / main.swift
 Sources/InkboardCheck/    自检程序（Command Line Tools 不带 XCTest，用它代替单元测试）

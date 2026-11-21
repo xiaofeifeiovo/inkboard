@@ -99,6 +99,127 @@ do {
     check(false, "JSON round-trip threw \(error)")
 }
 
+func hline(_ x0: CGFloat, _ x1: CGFloat, y: CGFloat) -> Stroke {
+    penStroke(line(from: CGPoint(x: x0, y: y), to: CGPoint(x: x1, y: y), samples: 10))
+}
+
+print("Page slicing")
+do {
+    let rows = (0..<40).map { hline(0, 600, y: 100 + CGFloat($0) * 60) }
+    let options = PageSlicer.Options()
+    let pages = PageSlicer.pages(for: rows, options: options)
+    let maxHeight = max(rows.unionBounds.width + 2 * options.padding, options.minWidth) * options.aspect
+    check(pages.count >= 2, "a long board becomes several pages (\(pages.count))")
+    check(pages.allSatisfy { $0.height <= maxHeight + 1 }, "pages stay within the A4-like height")
+    check(zip(pages, pages.dropFirst()).allSatisfy { $0.maxY <= $1.minY }, "pages run top to bottom without overlap")
+    check(rows.allSatisfy { row in pages.filter { $0.contains(row.bounds) }.count == 1 },
+          "every line of writing lies whole on exactly one page")
+
+    let tall = penStroke(line(from: CGPoint(x: 50, y: 0), to: CGPoint(x: 60, y: 5000), samples: 50))
+    let tallPages = PageSlicer.pages(for: [tall], options: options)
+    check(tallPages.count >= 3 && tallPages.allSatisfy { $0.height <= options.maxSide + 1 },
+          "a single band taller than a page is cut into slices (\(tallPages.count))")
+    check(zip(tallPages, tallPages.dropFirst()).allSatisfy { abs($0.maxY - $1.minY) <= 1 },
+          "slices of one band are contiguous")
+
+    let gapped = PageSlicer.pages(for: [hline(0, 400, y: 100), hline(0, 400, y: 6000)], options: options)
+    check(gapped.count == 2 && gapped.allSatisfy { $0.height < 200 }, "blank stretches are skipped, not sent as pages")
+
+    let wide = PageSlicer.pages(for: [hline(0, 5000, y: 100)], options: options)
+    check(wide.count == 3 && Set(wide.map(\.minY)).count == 1 && zip(wide, wide.dropFirst()).allSatisfy { $0.minX < $1.minX },
+          "a board wider than the page limit is tiled left to right (\(wide.count))")
+
+    let image = InkImage.render([tall], rect: tallPages[0], maxPixels: 1000)
+    check(image.map { max($0.pixelSize.width, $0.pixelSize.height) <= 1000 } == true, "page images respect the pixel limit")
+    check(InkImage.render([tall], rect: CGRect(x: 500, y: 0, width: 100, height: 100)) == nil, "a box without ink renders nothing")
+}
+
+print("Transcript cleanup")
+do {
+    check(TranscriptCleanup.latex("```latex\n\\frac{a}{b}\n```") == "\\frac{a}{b}", "code fence removed from LaTeX")
+    check(TranscriptCleanup.latex(" $$x^2$$ ") == "x^2" && TranscriptCleanup.latex("\\[ x \\]") == "x", "math delimiters removed")
+    check(TranscriptCleanup.latex("$a$ + $b$") == "$a$ + $b$", "separate inline formulas are left alone")
+    check(TranscriptCleanup.markdown("```markdown\n# T\n\ntext\n```") == "# T\n\ntext\n", "fence around the whole Markdown removed")
+    let withCode = "# T\n```py\nx\n```"
+    check(TranscriptCleanup.markdown(withCode) == withCode + "\n", "code blocks inside Markdown are kept")
+}
+
+print("Agent command line")
+do {
+    check(ACPAgentConfiguration.splitArguments(#"acp --model "a b" 'c' --x """#) == ["acp", "--model", "a b", "c", "--x", ""],
+          "arguments split on spaces, quotes group words")
+    check(ACPAgentConfiguration.splitArguments("  ").isEmpty, "blank arguments give none")
+    let found = ACPAgentConfiguration.locate("agy", searchPath: ["/a", "/b"], isExecutable: { $0 == "/b/agy" })
+    check(found?.path == "/b/agy", "a bare command is looked up in the search path")
+    let tilde = ACPAgentConfiguration.locate("~/x/agy", home: "/h", isExecutable: { $0 == "/h/x/agy" })
+    check(tilde?.path == "/h/x/agy", "~ in a path expands to the home folder")
+    check(ACPAgentConfiguration.locate("nope", searchPath: ["/a"], isExecutable: { _ in false }) == nil, "missing command gives nil")
+}
+
+print("ACP client (mock agent)")
+let python = "/usr/bin/python3"
+if FileManager.default.isExecutableFile(atPath: python) {
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent("InkboardCheck-\(UUID().uuidString)")
+    try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    let script = folder.appendingPathComponent("mock_agent.py")
+    try? mockAgentSource.write(to: script, atomically: true, encoding: .utf8)
+    let agent = ACPAgent(configuration: ACPAgentConfiguration(
+        executable: URL(fileURLWithPath: python), arguments: ["-I", script.path],
+        environment: ProcessInfo.processInfo.environment, workingDirectory: folder))
+    let png = InkImage.render([hline(0, 100, y: 10)], rect: CGRect(x: 0, y: 0, width: 120, height: 30))!.pngData
+
+    do {
+        let catalog = try await agent.modelCatalog()
+        check(catalog.models.map(\.value) == ["alpha", "beta"] && catalog.defaultModel == "alpha",
+              "reads the models, including grouped options")
+        check(catalog.thoughtLevels["alpha"]?.map(\.value) == ["low", "high"] && catalog.thoughtLevels["beta"]?.map(\.value) == ["low"],
+              "reads each model's thinking levels")
+
+        let reply = try await agent.prompt([ACPContent.text("hi"), ACPContent.image(png: png)], model: "beta", thoughtLevel: "high")
+        check(TranscriptCleanup.latex(reply) == "model=beta level=low images=1 permission=no",
+              "sets the model, skips a level the model lacks, sends the image, declines permissions (\(reply.debugDescription))")
+    } catch {
+        check(false, "mock agent conversation threw \(error)")
+    }
+
+    do {
+        _ = try await agent.prompt([ACPContent.text("hi")], model: "gamma", thoughtLevel: "")
+        check(false, "an unknown model is rejected")
+    } catch ACPError.unknownOption(_, let value, let available) {
+        check(value == "gamma" && available == ["alpha", "beta"], "an unknown model is rejected, listing the choices")
+    } catch {
+        check(false, "unknown model threw \(error)")
+    }
+
+    let started = Date()
+    let slow = Task { try await agent.prompt([ACPContent.text("SLOW")], model: "", thoughtLevel: "") }
+    try? await Task.sleep(nanoseconds: 300_000_000)
+    slow.cancel()
+    do {
+        _ = try await slow.value
+        check(false, "cancelling stops the prompt")
+    } catch {
+        check(error is CancellationError && Date().timeIntervalSince(started) < 3, "cancelling sends session/cancel and stops the prompt")
+    }
+
+    do {
+        _ = try await agent.prompt([ACPContent.text("CRASH")], model: "", thoughtLevel: "")
+        check(false, "a crashing agent fails the request")
+    } catch {
+        check(error.localizedDescription.contains("mock agent crashed"), "a crashing agent fails the request with its stderr")
+    }
+    do {
+        let again = try await agent.prompt([ACPContent.text("hi")], model: "", thoughtLevel: "")
+        check(again.contains("model=alpha"), "the agent is restarted on the next request")
+    } catch {
+        check(false, "restart after crash threw \(error)")
+    }
+    agent.shutdown()
+    try? FileManager.default.removeItem(at: folder)
+} else {
+    print("  - skipped: \(python) not found")
+}
+
 // Sample render for eyeballing stroke quality.
 let outputPath = CommandLine.arguments.dropFirst().first ?? "inkboard-sample.png"
 do {
