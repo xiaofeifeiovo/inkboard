@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key><string>Inkboard</string>
+    <key>CFBundleDisplayName</key><string>Inkboard</string>
+    <key>CFBundleExecutable</key><string>Inkboard</string>
+    <key>CFBundleIdentifier</key><string>local.inkboard.prototype</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleShortVersionString</key><string>0.2</string>
+    <key>CFBundleVersion</key><string>2</string>
+    <key>CFBundleDevelopmentRegion</key><string>zh_CN</string>
+    <key>CFBundleLocalizations</key><array><string>zh-Hans</string></array>
+    <key>LSMinimumSystemVersion</key><string>13.0</string>
+    <key>NSHighResolutionCapable</key><true/>
+    <key>NSPrincipalClass</key><string>NSApplication</string>
+
+    <!-- The app opens and owns .inkboard files (class BoardDocument). -->
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeName</key><string>Inkboard 手绘文件</string>
+            <key>CFBundleTypeRole</key><string>Editor</string>
+            <key>LSHandlerRank</key><string>Owner</string>
+            <key>LSItemContentTypes</key><array><string>local.inkboard.board</string></array>
+            <key>NSDocumentClass</key><string>BoardDocument</string>
+        </dict>
+    </array>
+
+    <!-- Declares the .inkboard file type (JSON inside; see InkboardCore/BoardStore.swift). -->
+    <key>UTExportedTypeDeclarations</key>
+    <array>
+        <dict>
+            <key>UTTypeIdentifier</key><string>local.inkboard.board</string>
+            <key>UTTypeDescription</key><string>Inkboard 手绘文件</string>
+            <key>UTTypeConformsTo</key><array><string>public.data</string><string>public.content</string></array>
+            <key>UTTypeTagSpecification</key>
+            <dict>
+                <key>public.filename-extension</key><array><string>inkboard</string></array>
+                <key>public.mime-type</key><string>application/x-inkboard+json</string>
+            </dict>
+        </dict>
+    </array>
+</dict>
+</plist>
