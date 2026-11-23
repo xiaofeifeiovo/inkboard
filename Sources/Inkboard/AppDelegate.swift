@@ -4,9 +4,9 @@ import InkboardCore
 /// Documents (windows, saving, Open Recent, restoring windows at launch) are run by
 /// NSDocumentController using BoardDocument, as declared in Support/Info.plist.
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    /// AI conversions go to the ACP agent chosen in 设置 (Antigravity's `agy acp` by default).
-    /// Settings are re-read for every request.
-    static let transcriber = ACPTranscriber { try AISettings.current.transcriberSettings() }
+    /// AI requests go to the backend chosen in 设置: an ACP agent (Antigravity's `agy acp` by
+    /// default) or an OpenAI-compatible API. Settings are re-read for every request.
+    static let transcriber = AITranscriber { try AISettings.current.transcriberSettings() }
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         // Set before launch finishes so NSDocumentController finds the Open Recent menu.
@@ -36,6 +36,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         CanvasView.showsDotGrid.toggle()
     }
 
+    /// 显示 → 显示分块 (applies to every window).
+    @objc func toggleBlocks(_ sender: Any?) {
+        CanvasView.showsBlocks.toggle()
+    }
+
     /// Called at launch when no window was restored, and when the Dock icon is clicked with no windows open.
     func applicationShouldOpenUntitledFile(_ sender: NSApplication) -> Bool {
         !LegacyBoard.importIfPresent()
@@ -46,6 +51,9 @@ extension AppDelegate: NSMenuItemValidation {
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         if menuItem.action == #selector(toggleDotGrid(_:)) {
             menuItem.state = CanvasView.showsDotGrid ? .on : .off
+        }
+        if menuItem.action == #selector(toggleBlocks(_:)) {
+            menuItem.state = CanvasView.showsBlocks ? .on : .off
         }
         return true
     }
@@ -63,7 +71,7 @@ enum LegacyBoard {
     /// Returns true when a legacy board was found and opened.
     static func importIfPresent() -> Bool {
         guard let data = try? Data(contentsOf: url),
-              let strokes = try? BoardStore.decode(data) else { return false }
+              let board = try? BoardStore.decode(data) else { return false }
 
         let imported = url.deletingLastPathComponent().appendingPathComponent("board.imported.json")
         do {
@@ -75,9 +83,9 @@ enum LegacyBoard {
             NSLog("Inkboard: could not rename legacy board: \(error)")
             return false   // leave it in place rather than risk importing twice
         }
-        guard !strokes.isEmpty else { return false }
+        guard !board.isEmpty else { return false }
 
-        let document = BoardDocument(importing: strokes)
+        let document = BoardDocument(importing: board)
         NSDocumentController.shared.addDocument(document)
         document.makeWindowControllers()
         document.showWindows()
