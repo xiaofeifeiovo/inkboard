@@ -130,15 +130,44 @@ final class MainWindowController: NSWindowController {
     }
 
     @objc func exportPNG(_ sender: Any?) {
-        guard let window,
-              let image = InkRenderer.renderImage(canvas.strokesForExport, scale: 2),
+        guard let image = InkRenderer.renderImage(canvas.boardForExport, scale: 2),
               let png = InkRenderer.pngData(image) else { NSSound.beep(); return }
+        save(png, as: .png)
+    }
+
+    /// A4 pages with vector ink (see PDFExport); only the selection when there is one.
+    @objc func exportPDF(_ sender: Any?) {
+        var options = PDFExport.Options()
+        options.title = exportBaseName
+        guard let pdf = PDFExport.data(canvas.boardForExport, options: options) else { NSSound.beep(); return }
+        save(pdf, as: .pdf)
+    }
+
+    private func save(_ data: Data, as type: UTType) {
+        guard let window else { return }
         let panel = NSSavePanel()
-        panel.allowedContentTypes = [.png]
-        panel.nameFieldStringValue = exportBaseName + ".png"
+        panel.allowedContentTypes = [type]
+        panel.nameFieldStringValue = exportBaseName + "." + (type.preferredFilenameExtension ?? "")
         panel.beginSheetModal(for: window) { response in
             guard response == .OK, let url = panel.url else { return }
-            do { try png.write(to: url) } catch { NSApp.presentError(error) }
+            do { try data.write(to: url) } catch { NSApp.presentError(error) }
+        }
+    }
+
+    /// 编辑 → 插入图片…: pictures from files (⌘V and dropping files onto the canvas work too).
+    @objc func insertImage(_ sender: Any?) {
+        guard let window else { return }
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.image]
+        panel.allowsMultipleSelection = true
+        panel.message = "选择要插入的图片"
+        panel.prompt = "插入"
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard response == .OK, let self else { return }
+            let datas = panel.urls.compactMap { try? Data(contentsOf: $0) }
+            if !self.canvas.insertImages(datas) {
+                self.showAlert(title: "无法插入图片", message: "无法读取所选文件中的图片。")
+            }
         }
     }
 
@@ -211,6 +240,61 @@ final class MainWindowController: NSWindowController {
         canvas.captureBusy = false
     }
 
+    // MARK: - 识别分块类型 (AI names the type of every line and drawing)
+
+    /// Sends the board with every line / drawing tagged (see BlockLabeling) and stores the answer
+    /// in the board's labels, which the segmentation then uses. Undoable; saved with the document.
+    @objc func labelBlocks(_ sender: Any?) {
+        guard documentTask == nil, !canvas.strokes.isEmpty else { NSSound.beep(); return }
+        documentRun += 1
+        let run = documentRun
+        let board = canvas.board
+        let options = AISettings.current.pageOptions
+        let transcriber = self.transcriber
+        transcriber.prepare()
+        documentBanner.show("正在识别分块类型…", style: .progress, button: "取消") { [weak self] in
+            self?.cancelDocument()
+        }
+
+        documentTask = Task { @MainActor [weak self] in
+            let result: Result<(labels: [Set<UUID>: InkBlock.Kind], units: [BlockLabeling.Unit]), Error>
+            do {
+                let request = await Task.detached(priority: .userInitiated) {
+                    BlockLabeling.request(for: board, options: options)
+                }.value
+                try Task.checkCancellation()
+                result = .success((try await transcriber.labelBlocks(request), request.units))
+            } catch {
+                result = .failure(error)
+            }
+            guard let self, self.documentRun == run else { return }
+            self.documentTask = nil
+            switch result {
+            case .success(let answer):
+                // Labels are keyed by strokes: ink edited meanwhile just doesn't match any more.
+                self.canvas.setLabels(answer.labels)
+                let lines = answer.units.filter(\.isLine).map(\.ids)
+                let formulas = lines.filter { answer.labels[$0] == .formula }.count
+                let graphics = answer.units.count - lines.count
+                var message = "已识别 \(answer.labels.count) 个区域：\(lines.count) 行中有 \(formulas) 行公式"
+                if graphics > 0 { message += "，\(graphics) 个图形" }
+                if answer.labels.count < answer.units.count { message += "（\(answer.units.count - answer.labels.count) 个没有得到回答）" }
+                if CanvasView.showsBlocks {
+                    self.documentBanner.show(message, style: .success, autoHide: 8)
+                } else {
+                    self.documentBanner.show(message, style: .success, button: "显示分块", action: {
+                        CanvasView.showsBlocks = true
+                    }, autoHide: 12)
+                }
+            case .failure(let error) where error is CancellationError:
+                self.documentBanner.hide()
+            case .failure(let error):
+                self.documentBanner.hide()
+                self.showAlert(title: "识别分块类型失败", message: error.localizedDescription)
+            }
+        }
+    }
+
     // MARK: - 全局转换 (whole board → Markdown next to the document)
 
     @objc func convertDocument(_ sender: Any?) {
@@ -256,8 +340,8 @@ final class MainWindowController: NSWindowController {
     private func startDocumentConversion(to output: URL) {
         documentRun += 1
         let run = documentRun
-        let strokes = canvas.strokes
-        let maxPixels = CGFloat(AISettings.current.maxImagePixels)
+        let board = canvas.board
+        let pageOptions = AISettings.current.pageOptions
         let transcriber = self.transcriber
         transcriber.prepare()
         documentBanner.show("正在准备图片…", style: .progress, button: "取消") { [weak self] in
@@ -268,7 +352,7 @@ final class MainWindowController: NSWindowController {
             let result: Result<Void, Error>
             do {
                 let pages = await Task.detached(priority: .userInitiated) {
-                    Self.pageImages(strokes, maxPixels: maxPixels)
+                    Self.pageImages(board, options: pageOptions)
                 }.value
                 try Task.checkCancellation()
                 self?.documentBanner.show("正在转换为 Markdown（\(pages.count) 张图片）…", style: .progress, button: "取消") {
@@ -305,12 +389,11 @@ final class MainWindowController: NSWindowController {
         documentBanner.hide()
     }
 
-    /// Cuts the board into pages (see PageSlicer) and renders each one.
-    private nonisolated static func pageImages(_ strokes: [Stroke], maxPixels: CGFloat) -> [InkImage] {
-        var options = PageSlicer.Options()
-        options.maxSide = maxPixels   // pages are rendered at no less than 1 pixel per canvas unit
-        return PageSlicer.pages(for: strokes, options: options).compactMap {
-            InkImage.render(strokes, rect: $0, maxPixels: maxPixels)
+    /// Splits the board into blocks (InkLayout), packs them into pages (PageAssembler) and renders
+    /// each page with only its own blocks (显示 → 显示分块 shows the same blocks and pages).
+    private nonisolated static func pageImages(_ board: Board, options: PageAssembler.Options) -> [InkImage] {
+        PageAssembler.pages(for: InkLayout.analyze(board).blocks, options: options).compactMap {
+            InkImage.render(board.subset($0.ids), rect: $0.rect, maxPixels: options.maxSide)
         }
     }
 
@@ -428,12 +511,12 @@ extension MainWindowController: NSMenuItemValidation {
         case #selector(selectPenWidth(_:)):
             menuItem.state = PenWidth(rawValue: menuItem.tag)?.value == canvas.penWidth ? .on : .off
             return true
-        case #selector(exportPNG(_:)), #selector(clearBoard(_:)):
-            return !canvas.strokes.isEmpty
+        case #selector(exportPNG(_:)), #selector(exportPDF(_:)), #selector(clearBoard(_:)):
+            return !canvas.board.isEmpty
         case #selector(toggleFormulaCapture(_:)):
             menuItem.state = canvas.isCapturingFormula ? .on : .off
             return true
-        case #selector(convertDocument(_:)):
+        case #selector(convertDocument(_:)), #selector(labelBlocks(_:)):
             return canConvertDocument
         default:
             return true

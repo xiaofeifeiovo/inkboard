@@ -1,8 +1,17 @@
 import Foundation
 import InkboardCore
 
-/// AI settings (「设置」window), stored in UserDefaults under "ai.*".
+/// AI settings (「设置」window), stored in UserDefaults under "ai.*" (API keys are in the
+/// keychain, see APIKeychain).
 struct AISettings: Equatable {
+    enum Backend: String {
+        /// An agent run as a subprocess and spoken to over ACP (Antigravity by default).
+        case acp
+        /// An OpenAI-compatible HTTP API (base URL + API key).
+        case openAI
+    }
+
+    var backend = Backend.acp
     /// Agent executable: a name looked up in the usual bin folders, or a path.
     var command = "agy"
     var arguments = "acp"
@@ -15,7 +24,22 @@ struct AISettings: Equatable {
     /// Longest side of each page image sent by 全局转换.
     var maxImagePixels = 2000
 
+    // The API backend keeps its own model choices (its model names differ from the agent's).
+    var apiBaseURL = "https://api.openai.com/v1"
+    var apiFormulaModel = ""
+    var apiFormulaThoughtLevel = ""
+    var apiDocumentModel = ""
+    var apiDocumentThoughtLevel = ""
+
     static let maxImagePixelsRange = 800...4000
+
+    /// How 全局转换 packs blocks into page images: pages are rendered at no less than 1 pixel per
+    /// canvas unit, so the longest page side in canvas units is the pixel limit.
+    var pageOptions: PageAssembler.Options {
+        var options = PageAssembler.Options()
+        options.maxSide = CGFloat(maxImagePixels)
+        return options
+    }
     /// Formula crops are small; this only caps a huge box.
     static let formulaMaxPixels: CGFloat = 1600
 
@@ -24,11 +48,12 @@ struct AISettings: Equatable {
         """
 
     static let defaultDocumentPrompt = """
-        这些图片是同一份手写笔记，按从上到下的顺序切成了几页，内容可能在两页的交界处被分开。请把全部内容整理成一份 Markdown 文档：
+        这些图片是同一份手写笔记，按阅读顺序分成了几页（很长的段落偶尔会跨页）。请把全部内容整理成一份 Markdown 文档：
         - 忠实保留原文的语言和内容，不要补充或删减观点；
         - 按内容的结构使用标题、列表、表格；
         - 数学公式写成 LaTeX，行内用 $…$，独立成行的用 $$…$$；
-        - 看不清的字写成 [?]；图形或草图用一句话描述，写成「> 图：…」。
+        - 看不清的字写成 [?]；图形或草图用一句话描述，写成「> 图：…」；
+        - 笔记里可能贴有截图或照片（上面可能有手写批注），同样用一句话概括它和批注的要点，写成「> 图：…」，不要逐字抄录截图里的文字。
         只输出 Markdown 正文，不要用代码块包起来，也不要额外说明。不要调用任何工具。
         """
 
@@ -43,7 +68,13 @@ struct AISettings: Equatable {
         ("ai.document.model", \.documentModel),
         ("ai.document.thoughtLevel", \.documentThoughtLevel),
         ("ai.document.prompt", \.documentPrompt),
+        ("ai.api.baseURL", \.apiBaseURL),
+        ("ai.api.formula.model", \.apiFormulaModel),
+        ("ai.api.formula.thoughtLevel", \.apiFormulaThoughtLevel),
+        ("ai.api.document.model", \.apiDocumentModel),
+        ("ai.api.document.thoughtLevel", \.apiDocumentThoughtLevel),
     ]
+    private static let backendKey = "ai.backend"
     private static let maxImagePixelsKey = "ai.document.maxImagePixels"
     private static let catalogKey = "ai.modelCatalog"
 
@@ -57,6 +88,9 @@ struct AISettings: Equatable {
             if defaults.object(forKey: maxImagePixelsKey) != nil {
                 settings.maxImagePixels = defaults.integer(forKey: maxImagePixelsKey)
             }
+            if let raw = defaults.string(forKey: backendKey), let backend = Backend(rawValue: raw) {
+                settings.backend = backend
+            }
             return settings
         }
         set {
@@ -64,6 +98,7 @@ struct AISettings: Equatable {
             let defaults = UserDefaults.standard
             for (key, path) in stringKeys { defaults.set(newValue[keyPath: path], forKey: key) }
             defaults.set(newValue.maxImagePixels, forKey: maxImagePixelsKey)
+            defaults.set(newValue.backend.rawValue, forKey: backendKey)
             NotificationCenter.default.post(name: didChange, object: nil)
         }
     }
@@ -72,10 +107,11 @@ struct AISettings: Equatable {
         let defaults = UserDefaults.standard
         for (key, _) in stringKeys { defaults.removeObject(forKey: key) }
         defaults.removeObject(forKey: maxImagePixelsKey)
+        defaults.removeObject(forKey: backendKey)
         NotificationCenter.default.post(name: didChange, object: nil)
     }
 
-    /// The models last read from the agent, with the command they were read from.
+    /// The models last read from the backend, with `catalogSource` at the time.
     static var cachedCatalog: (command: String, catalog: ACPModelCatalog)? {
         get {
             guard let data = UserDefaults.standard.data(forKey: catalogKey),
@@ -97,8 +133,29 @@ struct AISettings: Equatable {
     static let workingDirectory = FileManager.default.temporaryDirectory
         .appendingPathComponent("Inkboard-ACP", isDirectory: true)
 
-    /// The command and arguments as one string (identifies a cached catalog).
+    /// The command and arguments as one string.
     var commandLine: String { "\(command) \(arguments)" }
+
+    /// Identifies which backend a cached model list belongs to.
+    var catalogSource: String { backend == .openAI ? "api \(apiBaseURL)" : commandLine }
+
+    /// Model and thinking level of the chosen backend.
+    var activeFormulaModel: String {
+        get { backend == .openAI ? apiFormulaModel : formulaModel }
+        set { if backend == .openAI { apiFormulaModel = newValue } else { formulaModel = newValue } }
+    }
+    var activeFormulaThoughtLevel: String {
+        get { backend == .openAI ? apiFormulaThoughtLevel : formulaThoughtLevel }
+        set { if backend == .openAI { apiFormulaThoughtLevel = newValue } else { formulaThoughtLevel = newValue } }
+    }
+    var activeDocumentModel: String {
+        get { backend == .openAI ? apiDocumentModel : documentModel }
+        set { if backend == .openAI { apiDocumentModel = newValue } else { documentModel = newValue } }
+    }
+    var activeDocumentThoughtLevel: String {
+        get { backend == .openAI ? apiDocumentThoughtLevel : documentThoughtLevel }
+        set { if backend == .openAI { apiDocumentThoughtLevel = newValue } else { documentThoughtLevel = newValue } }
+    }
 
     func agentConfiguration() throws -> ACPAgentConfiguration {
         guard let executable = ACPAgentConfiguration.locate(command) else {
@@ -113,16 +170,30 @@ struct AISettings: Equatable {
                                      workingDirectory: Self.workingDirectory)
     }
 
-    func transcriberSettings() throws -> ACPTranscriberSettings {
-        ACPTranscriberSettings(
-            agent: try agentConfiguration(),
-            formula: TranscriptionProfile(model: formulaModel, thoughtLevel: formulaThoughtLevel, prompt: formulaPrompt),
-            document: TranscriptionProfile(model: documentModel, thoughtLevel: documentThoughtLevel, prompt: documentPrompt))
+    /// The API key is read from the keychain here, i.e. only when a request is made.
+    func backendConfiguration() throws -> AIBackendConfiguration {
+        switch backend {
+        case .acp:
+            return .acp(try agentConfiguration())
+        case .openAI:
+            guard let url = OpenAIConfiguration.normalizedBaseURL(apiBaseURL) else {
+                throw AISettingsError.invalidBaseURL(apiBaseURL)
+            }
+            return .openAI(OpenAIConfiguration(baseURL: url, apiKey: APIKeychain.key(for: url) ?? ""))
+        }
+    }
+
+    func transcriberSettings() throws -> AITranscriberSettings {
+        AITranscriberSettings(
+            backend: try backendConfiguration(),
+            formula: TranscriptionProfile(model: activeFormulaModel, thoughtLevel: activeFormulaThoughtLevel, prompt: formulaPrompt),
+            document: TranscriptionProfile(model: activeDocumentModel, thoughtLevel: activeDocumentThoughtLevel, prompt: documentPrompt))
     }
 }
 
 enum AISettingsError: LocalizedError {
     case agentNotFound(String)
+    case invalidBaseURL(String)
 
     var errorDescription: String? {
         switch self {
@@ -131,6 +202,11 @@ enum AISettingsError: LocalizedError {
             return name.isEmpty
                 ? "还没有设置 agent 程序。请在「设置」（⌘,）中填写。"
                 : "找不到 agent 程序「\(name)」。请在「设置」（⌘,）中填写完整路径。"
+        case .invalidBaseURL(let text):
+            let value = text.trimmingCharacters(in: .whitespaces)
+            return value.isEmpty
+                ? "还没有填写 API 的 Base URL。请在「设置」（⌘,）中填写，例如 https://api.openai.com/v1。"
+                : "API 的 Base URL「\(value)」不是有效的 http(s) 地址。请在「设置」（⌘,）中修改。"
         }
     }
 }

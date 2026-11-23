@@ -1,7 +1,7 @@
 import CoreGraphics
 import Foundation
 
-/// Pure editing operations on a list of strokes. The app layer owns undo and redraw.
+/// Pure editing operations on strokes and boards. The app layer owns undo and redraw.
 public enum InkOps {
 
     // MARK: Eraser
@@ -82,6 +82,33 @@ public enum InkOps {
         return nil
     }
 
+    /// Lasso over a whole board: strokes as above, and pictures with at least `threshold` of
+    /// their area inside the polygon.
+    public static func selection(inLasso polygon: [CGPoint], in board: Board, threshold: CGFloat = 0.5) -> Set<UUID> {
+        var selected = strokes(inLasso: polygon, from: board.strokes, threshold: threshold)
+        guard polygon.count >= 3 else { return selected }
+        let lassoBounds = boundingRect(of: polygon)
+        let n = 5   // sample a 5×5 grid over each picture
+        for image in board.images where image.frame.intersects(lassoBounds) {
+            var inside = 0
+            for i in 0..<n {
+                for j in 0..<n {
+                    let p = CGPoint(x: image.frame.minX + image.frame.width * (CGFloat(i) + 0.5) / CGFloat(n),
+                                    y: image.frame.minY + image.frame.height * (CGFloat(j) + 0.5) / CGFloat(n))
+                    if contains(polygon, p) { inside += 1 }
+                }
+            }
+            if CGFloat(inside) / CGFloat(n * n) >= threshold { selected.insert(image.id) }
+        }
+        return selected
+    }
+
+    /// Topmost item under `point`: ink first (it is drawn above pictures), then the front-most picture.
+    public static func hitTest(_ point: CGPoint, in board: Board, tolerance: CGFloat) -> UUID? {
+        hitTest(point, in: board.strokes, tolerance: tolerance)
+            ?? board.images.last { $0.frame.insetBy(dx: -tolerance, dy: -tolerance).contains(point) }?.id
+    }
+
     /// Even-odd ray casting.
     public static func contains(_ polygon: [CGPoint], _ p: CGPoint) -> Bool {
         var inside = false
@@ -103,19 +130,53 @@ public enum InkOps {
         strokes.map { ids.contains($0.id) ? $0.translated(dx: dx, dy: dy) : $0 }
     }
 
-    // MARK: Insert space (OneNote-style)
-
-    /// Strokes that an insert-space gesture starting at `y` pushes: everything whose
-    /// vertical centre lies below the line (descenders crossing it don't drag a line of text along).
-    public static func strokesBelow(_ y: CGFloat, in strokes: [Stroke]) -> Set<UUID> {
-        Set(strokes.lazy.filter { $0.bounds.midY > y }.map(\.id))
+    public static func translate(_ board: Board, ids: Set<UUID>, dx: CGFloat, dy: CGFloat) -> Board {
+        Board(strokes: translate(board.strokes, ids: ids, dx: dx, dy: dy),
+              images: board.images.map { ids.contains($0.id) ? $0.translated(dx: dx, dy: dy) : $0 })
     }
 
-    /// Most negative offset allowed when removing space: moved ink may not cross above the line.
-    public static func minimumSpaceDelta(lineY: CGFloat, moving ids: Set<UUID>, in strokes: [Stroke]) -> CGFloat {
-        let top = strokes.lazy.filter { ids.contains($0.id) }.map(\.bounds.minY).min()
-        guard let top else { return 0 }
-        return min(0, lineY - top)
+    // MARK: Resizing pictures
+
+    /// Corners of a rectangle in canvas coordinates (y down, so "top" is minY).
+    public enum Corner: CaseIterable {
+        case topLeft, topRight, bottomLeft, bottomRight
+
+        public func point(in rect: CGRect) -> CGPoint {
+            CGPoint(x: isLeft ? rect.minX : rect.maxX, y: isTop ? rect.minY : rect.maxY)
+        }
+
+        var isLeft: Bool { self == .topLeft || self == .bottomLeft }
+        var isTop: Bool { self == .topLeft || self == .topRight }
+    }
+
+    /// `frame` resized by dragging `corner` to `point`. The opposite corner stays put and the
+    /// aspect ratio is kept; the shorter side never goes below `minSide`, and the frame doesn't flip.
+    public static func resize(_ frame: CGRect, dragging corner: Corner, to point: CGPoint, minSide: CGFloat) -> CGRect {
+        guard frame.width > 0, frame.height > 0 else { return frame }
+        let anchor = CGPoint(x: corner.isLeft ? frame.maxX : frame.minX, y: corner.isTop ? frame.maxY : frame.minY)
+        let reachX = (point.x - anchor.x) * (corner.isLeft ? -1 : 1)
+        let reachY = (point.y - anchor.y) * (corner.isTop ? -1 : 1)
+        let scale = max(reachX / frame.width, reachY / frame.height, minSide / min(frame.width, frame.height))
+        let size = CGSize(width: frame.width * scale, height: frame.height * scale)
+        return CGRect(x: corner.isLeft ? anchor.x - size.width : anchor.x,
+                      y: corner.isTop ? anchor.y - size.height : anchor.y,
+                      width: size.width, height: size.height)
+    }
+
+    // MARK: Insert space (OneNote-style)
+
+    /// Items that an insert-space gesture starting at `y` pushes: everything whose vertical
+    /// centre lies below the line (descenders crossing it don't drag a line of text along).
+    public static func itemsBelow(_ y: CGFloat, in board: Board) -> Set<UUID> {
+        Set(board.strokes.lazy.filter { $0.bounds.midY > y }.map(\.id))
+            .union(board.images.lazy.filter { $0.frame.midY > y }.map(\.id))
+    }
+
+    /// Most negative offset allowed when removing space: moved items may not cross above the line.
+    public static func minimumSpaceDelta(lineY: CGFloat, moving ids: Set<UUID>, in board: Board) -> CGFloat {
+        let top = board.bounds(of: ids)
+        guard !top.isNull else { return 0 }
+        return min(0, lineY - top.minY)
     }
 
     // MARK: Helpers

@@ -1,12 +1,20 @@
 import AppKit
 import InkboardCore
 
-/// 设置 (⌘,): which ACP agent to run, and the model, thinking level and prompt used by
-/// 局部转换 and 全局转换. Every edit is saved right away. The model lists come from the agent
-/// itself (its session config options) and are cached, since they change between agent versions.
+/// 设置 (⌘,): where AI requests go — an ACP agent or an OpenAI-compatible API — and the model,
+/// thinking level and prompt used by 局部转换 and 全局转换 (识别分块类型 uses 全局转换's model).
+/// Every edit is saved right away. Model lists come from the backend itself (the agent's session
+/// config options, or the API's /models) and are cached; a model can also be typed in.
 final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, NSTextViewDelegate {
     static let shared = SettingsWindowController()
 
+    /// Marks the 「其他模型…」 menu item.
+    private static let otherModel = "\u{1}other"
+
+    private let backendPopup = NSPopUpButton()
+    private let baseURLField = NSTextField()
+    private let apiKeyField = NSSecureTextField()
+    private var grid: NSGridView!
     private let commandField = NSTextField()
     private let argumentsField = NSTextField()
     private let agentStatus = NSTextField(wrappingLabelWithString: "")
@@ -48,15 +56,30 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
 
     // MARK: - Layout
 
+    // Rows shown for one backend only.
+    private static let agentRows = [2, 3], apiRows = [4, 5]
+
     private func buildUI() {
+        for (title, backend) in [("ACP agent（Antigravity、Gemini CLI 等）", AISettings.Backend.acp),
+                                 ("OpenAI 兼容 API", .openAI)] {
+            let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            item.representedObject = backend.rawValue
+            backendPopup.menu?.addItem(item)
+        }
+        backendPopup.target = self
+        backendPopup.action = #selector(backendChanged(_:))
+
         commandField.placeholderString = "agy"
         argumentsField.placeholderString = "acp"
+        baseURLField.placeholderString = "https://api.openai.com/v1"
+        apiKeyField.placeholderString = "存在钥匙串中；本地服务可留空"
         maxPixelsField.alignment = .right
-        for field in [commandField, argumentsField, maxPixelsField] {
+        for field in [commandField, argumentsField, baseURLField, apiKeyField, maxPixelsField] {
             field.delegate = self
         }
-        commandField.widthAnchor.constraint(equalToConstant: 300).isActive = true
-        argumentsField.widthAnchor.constraint(equalToConstant: 300).isActive = true
+        for field in [commandField, argumentsField, baseURLField, apiKeyField] {
+            field.widthAnchor.constraint(equalToConstant: 300).isActive = true
+        }
         maxPixelsField.widthAnchor.constraint(equalToConstant: 70).isActive = true
 
         let choose = NSButton(title: "选择…", target: self, action: #selector(chooseCommand(_:)))
@@ -84,16 +107,19 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         let empty = NSGridCell.emptyContentView
 
         let rows: [[NSView]] = [
-            [section("Agent（ACP）"), empty],
+            [section("调用方式"), empty],
+            [label("方式："), backendPopup],
             [label("命令："), row(commandField, choose)],
             [label("参数："), argumentsField],
+            [label("Base URL："), baseURLField],
+            [label("API Key："), apiKeyField],
             [empty, row(refreshButton, refreshSpinner)],
             [empty, agentStatus],
             [section("局部转换：公式 → LaTeX"), empty],
             [label("模型："), formulaModel],
             [label("思考档位："), formulaLevel],
             [label("提示词："), formulaPromptView],
-            [section("全局转换：画板 → Markdown"), empty],
+            [section("全局转换：画板 → Markdown（识别分块类型也用这个模型）"), empty],
             [label("模型："), documentModel],
             [label("思考档位："), documentLevel],
             [label("单张图片最长边："), row(maxPixelsField, NSTextField(labelWithString: "像素"))],
@@ -101,6 +127,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
             [empty, reset],
         ]
         let grid = NSGridView(views: rows)
+        self.grid = grid
         grid.rowSpacing = 8
         grid.columnSpacing = 8
         grid.column(at: 0).xPlacement = .trailing
@@ -172,33 +199,55 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         isLoading = true
         defer { isLoading = false }
         let settings = AISettings.current
-        if let cached = AISettings.cachedCatalog, cached.command == settings.commandLine {
+        if let cached = AISettings.cachedCatalog, cached.command == settings.catalogSource {
             catalog = cached.catalog
         } else {
             catalog = nil
         }
+        backendPopup.selectItem(at: settings.backend == .openAI ? 1 : 0)
+        showRows(for: settings.backend)
         commandField.stringValue = settings.command
         argumentsField.stringValue = settings.arguments
+        baseURLField.stringValue = settings.apiBaseURL
+        loadAPIKey()
         maxPixelsField.stringValue = String(settings.maxImagePixels)
         if formulaPrompt.string != settings.formulaPrompt { formulaPrompt.string = settings.formulaPrompt }
         if documentPrompt.string != settings.documentPrompt { documentPrompt.string = settings.documentPrompt }
-        fillModels(formulaModel, selected: settings.formulaModel)
-        fillLevels(formulaLevel, model: settings.formulaModel, selected: settings.formulaThoughtLevel)
-        fillModels(documentModel, selected: settings.documentModel)
-        fillLevels(documentLevel, model: settings.documentModel, selected: settings.documentThoughtLevel)
+        fillModels(formulaModel, selected: settings.activeFormulaModel)
+        fillLevels(formulaLevel, model: settings.activeFormulaModel, selected: settings.activeFormulaThoughtLevel)
+        fillModels(documentModel, selected: settings.activeDocumentModel)
+        fillLevels(documentLevel, model: settings.activeDocumentModel, selected: settings.activeDocumentThoughtLevel)
         showAgentStatus()
+    }
+
+    private func showRows(for backend: AISettings.Backend) {
+        for index in Self.agentRows { grid.row(at: index).isHidden = backend != .acp }
+        for index in Self.apiRows { grid.row(at: index).isHidden = backend != .openAI }
+        if let content = window?.contentView { window?.setContentSize(content.fittingSize) }
+    }
+
+    /// The keychain is only read when the API backend is in use.
+    private func loadAPIKey() {
+        let settings = AISettings.current
+        guard settings.backend == .openAI, let url = OpenAIConfiguration.normalizedBaseURL(settings.apiBaseURL) else {
+            apiKeyField.stringValue = ""
+            return
+        }
+        apiKeyField.stringValue = APIKeychain.key(for: url) ?? ""
     }
 
     private func save() {
         guard !isLoading else { return }
         var settings = AISettings.current
+        settings.backend = backendPopup.indexOfSelectedItem == 1 ? .openAI : .acp
         settings.command = commandField.stringValue.trimmingCharacters(in: .whitespaces)
         settings.arguments = argumentsField.stringValue
-        settings.formulaModel = value(of: formulaModel)
-        settings.formulaThoughtLevel = value(of: formulaLevel)
+        settings.apiBaseURL = baseURLField.stringValue.trimmingCharacters(in: .whitespaces)
+        settings.activeFormulaModel = value(of: formulaModel)
+        settings.activeFormulaThoughtLevel = value(of: formulaLevel)
         settings.formulaPrompt = formulaPrompt.string
-        settings.documentModel = value(of: documentModel)
-        settings.documentThoughtLevel = value(of: documentLevel)
+        settings.activeDocumentModel = value(of: documentModel)
+        settings.activeDocumentThoughtLevel = value(of: documentLevel)
         settings.documentPrompt = documentPrompt.string
         if let pixels = Int(maxPixelsField.stringValue.trimmingCharacters(in: .whitespaces)) {
             settings.maxImagePixels = min(max(pixels, AISettings.maxImagePixelsRange.lowerBound),
@@ -216,7 +265,13 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         if !selected.isEmpty, !values.contains(where: { $0.value == selected }) {
             values.append(ACPConfigOption.Value(value: selected, name: selected))
         }
-        fill(popup, defaultTitle: "agent 默认", values: values, selected: selected)
+        // An API has no default model; an agent does.
+        let isAPI = AISettings.current.backend == .openAI
+        fill(popup, defaultTitle: isAPI ? "（未选择）" : "agent 默认", values: values, selected: selected)
+        popup.menu?.addItem(.separator())
+        let other = NSMenuItem(title: "其他模型…", action: nil, keyEquivalent: "")
+        other.representedObject = Self.otherModel
+        popup.menu?.addItem(other)
     }
 
     private func fillLevels(_ popup: NSPopUpButton, model: String, selected: String) {
@@ -242,8 +297,19 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
     private func showAgentStatus(_ message: String? = nil, isError: Bool = false) {
         var text = message
         var error = isError
+        let settings = AISettings.current
+        if text == nil, settings.backend == .openAI {
+            if let url = OpenAIConfiguration.normalizedBaseURL(settings.apiBaseURL) {
+                text = "地址：\(url.absoluteString)/chat/completions"
+                if let catalog { text! += "（\(catalog.models.count) 个模型）" }
+                if apiKeyField.stringValue.isEmpty { text! += "\n未填写 API Key（本地服务通常不需要）。" }
+            } else {
+                text = "请填写 Base URL，例如 https://api.openai.com/v1。"
+                error = true
+            }
+        }
         if text == nil {
-            let command = AISettings.current.command
+            let command = settings.command
             if let url = ACPAgentConfiguration.locate(command) {
                 text = "程序：\(url.path)"
                 if let catalog { text! += "（\(catalog.models.count) 个模型）" }
@@ -258,7 +324,17 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
 
     // MARK: - Actions
 
+    @objc private func backendChanged(_ sender: Any?) {
+        save()
+        load()
+        if catalog == nil { refreshModels(nil) }
+    }
+
     @objc private func popupChanged(_ sender: NSPopUpButton) {
+        if value(of: sender) == Self.otherModel {
+            askForModelName(for: sender)
+            return
+        }
         // A new model may not offer the chosen thinking level; fall back to its default.
         if sender === formulaModel || sender === documentModel {
             let levels = sender === formulaModel ? formulaLevel : documentLevel
@@ -273,7 +349,43 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         save()
     }
 
+    /// 「其他模型…」: a model the list doesn't offer (or no list could be read).
+    private func askForModelName(for popup: NSPopUpButton) {
+        let settings = AISettings.current
+        let current = popup === formulaModel ? settings.activeFormulaModel : settings.activeDocumentModel
+        isLoading = true
+        fillModels(popup, selected: current)   // undo the selection of 「其他模型…」 for now
+        isLoading = false
+        guard let window else { return }
+        let field = NSTextField(string: current)
+        field.frame = NSRect(x: 0, y: 0, width: 280, height: 22)
+        let alert = NSAlert()
+        alert.messageText = "填写模型名"
+        alert.informativeText = "例如 gpt-4o、gemini-2.5-pro、qwen-vl-max。需要是支持图片输入的模型。"
+        alert.accessoryView = field
+        alert.addButton(withTitle: "好")
+        alert.addButton(withTitle: "取消")
+        alert.window.initialFirstResponder = field
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard let self, response == .alertFirstButtonReturn else { return }
+            let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            self.isLoading = true
+            self.fillModels(popup, selected: name)
+            let levels = popup === self.formulaModel ? self.formulaLevel : self.documentLevel
+            self.fillLevels(levels, model: name, selected: "")
+            self.isLoading = false
+            self.save()
+        }
+    }
+
     func controlTextDidChange(_ notification: Notification) {
+        if notification.object as? NSTextField === apiKeyField {
+            if let url = OpenAIConfiguration.normalizedBaseURL(baseURLField.stringValue) {
+                APIKeychain.setKey(apiKeyField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), for: url)
+            }
+            showAgentStatus()
+            return
+        }
         save()
     }
 
@@ -282,6 +394,9 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         if field === maxPixelsField {
             maxPixelsField.stringValue = String(AISettings.current.maxImagePixels)
         } else if field === commandField || field === argumentsField {
+            agentDidChange()
+        } else if field === baseURLField {
+            loadAPIKey()   // each base URL has its own key
             agentDidChange()
         }
     }
@@ -309,15 +424,15 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
     }
 
     @objc private func resetToDefaults(_ sender: Any?) {
-        let before = AISettings.current.commandLine
+        let before = AISettings.current.catalogSource
         AISettings.reset()
         load()
-        if AISettings.current.commandLine != before || catalog == nil { refreshModels(nil) }
+        if AISettings.current.catalogSource != before || catalog == nil { refreshModels(nil) }
     }
 
-    /// The command line changed: the cached model list belongs to the old agent.
+    /// The agent command or the API address changed: the cached model list belongs to the old one.
     private func agentDidChange() {
-        if AISettings.cachedCatalog?.command != AISettings.current.commandLine {
+        if AISettings.cachedCatalog?.command != AISettings.current.catalogSource {
             load()
             refreshModels(nil)
         } else {
@@ -329,16 +444,16 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         fetchTask?.cancel()
         fetchTask = nil
         let settings = AISettings.current
-        let configuration: ACPAgentConfiguration
+        let configuration: AIBackendConfiguration
         do {
-            configuration = try settings.agentConfiguration()
+            configuration = try settings.backendConfiguration()
         } catch {
             showAgentStatus()
             return
         }
         refreshButton.isEnabled = false
         refreshSpinner.startAnimation(nil)
-        showAgentStatus("正在启动 agent 并读取模型列表…")
+        showAgentStatus(settings.backend == .openAI ? "正在读取模型列表…" : "正在启动 agent 并读取模型列表…")
 
         fetchTask = Task { @MainActor [weak self] in
             let result: Result<ACPModelCatalog, Error>
@@ -353,13 +468,16 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
             self.refreshSpinner.stopAnimation(nil)
             switch result {
             case .success(let catalog):
-                AISettings.cachedCatalog = (settings.commandLine, catalog)
+                AISettings.cachedCatalog = (settings.catalogSource, catalog)
                 self.load()
                 if catalog.models.isEmpty {
-                    self.showAgentStatus("这个 agent 没有提供可选的模型，将使用它的默认模型。")
+                    self.showAgentStatus(settings.backend == .openAI
+                        ? "这个 API 没有返回模型列表，请用「其他模型…」填写模型名。"
+                        : "这个 agent 没有提供可选的模型，将使用它的默认模型。")
                 }
             case .failure(let error):
-                self.showAgentStatus("读取失败：\(error.localizedDescription)", isError: true)
+                self.showAgentStatus("读取失败：\(error.localizedDescription)" + (settings.backend == .openAI
+                    ? "\n也可以用「其他模型…」直接填写模型名。" : ""), isError: true)
             }
         }
     }

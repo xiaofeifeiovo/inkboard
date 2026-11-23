@@ -19,11 +19,22 @@ final class CanvasView: NSView {
         didSet {
             guard showsDotGrid != oldValue else { return }
             UserDefaults.standard.set(showsDotGrid, forKey: dotGridKey)
-            NotificationCenter.default.post(name: dotGridDidChange, object: nil)
+            NotificationCenter.default.post(name: displayOptionsDidChange, object: nil)
         }
     }
     private static let dotGridKey = "canvas.showsDotGrid"
-    private static let dotGridDidChange = Notification.Name("InkboardDotGridDidChange")
+
+    /// 显示 → 显示分块: outlines the blocks found by InkLayout (numbered in reading order) and the
+    /// pages 全局转换 would send. App-wide, off by default; for checking and tuning the segmentation.
+    static var showsBlocks: Bool = UserDefaults.standard.bool(forKey: blocksKey) {
+        didSet {
+            guard showsBlocks != oldValue else { return }
+            UserDefaults.standard.set(showsBlocks, forKey: blocksKey)
+            NotificationCenter.default.post(name: displayOptionsDidChange, object: nil)
+        }
+    }
+    private static let blocksKey = "canvas.showsBlocks"
+    private static let displayOptionsDidChange = Notification.Name("InkboardDisplayOptionsDidChange")
 
     // MARK: - Public state
 
@@ -68,14 +79,20 @@ final class CanvasView: NSView {
     var onFormulaCapture: ((CGRect) -> Void)?
     var onCaptureModeChange: ((Bool) -> Void)?
 
-    private(set) var strokes: [Stroke] = []
+    /// Pictures and ink. Pictures are drawn under all ink; the eraser and the AI conversions
+    /// only deal with ink.
+    private(set) var board = Board() {
+        didSet { layoutOverlay = nil }
+    }
+    var strokes: [Stroke] { board.strokes }
+    /// Ids of selected strokes and pictures.
     private(set) var selection: Set<UUID> = [] {
         didSet { if selection != oldValue { updateCursor() } }
     }
 
-    /// The selection if there is one, otherwise everything (for export / transcription).
-    var strokesForExport: [Stroke] {
-        selection.isEmpty ? strokes : strokes.filter { selection.contains($0.id) }
+    /// The selection if there is one, otherwise everything (for export).
+    var boardForExport: Board {
+        selection.isEmpty ? board : board.subset(selection)
     }
 
     // MARK: - Gesture state
@@ -96,7 +113,7 @@ final class CanvasView: NSView {
     }
 
     private struct EraseSession {
-        let before: [Stroke]
+        let before: Board
         var last: CGPoint
         var changed = false
     }
@@ -114,11 +131,20 @@ final class CanvasView: NSView {
         let movingBounds: CGRect
     }
 
+    /// Dragging a corner handle of the one selected picture.
+    private struct ResizeSession {
+        let id: UUID
+        let original: CGRect
+        let corner: InkOps.Corner
+        var frame: CGRect
+    }
+
     private enum Gesture {
         case draw(LiveStroke)
         case erase(EraseSession)
         case lasso([CGPoint])
         case move(MoveSession)
+        case resize(ResizeSession)
         case insertSpace(SpaceSession)
         case pan(lastWindowPoint: NSPoint)
         case capture(start: CGPoint, current: CGPoint)
@@ -132,7 +158,9 @@ final class CanvasView: NSView {
     private var mouseLocation: CGPoint?
     private var proximityMonitor: Any?
     private var resignKeyObserver: NSObjectProtocol?
-    private var dotGridObserver: NSObjectProtocol?
+    private var displayObservers: [NSObjectProtocol] = []
+    /// Blocks and pages for 显示分块, computed when first drawn after a change.
+    private var layoutOverlay: (blocks: [InkBlock], pages: [InkPage])?
 
     // MARK: - NSView
 
@@ -150,6 +178,7 @@ final class CanvasView: NSView {
         resignKeyObserver = nil
         guard let window else { return }
         window.makeFirstResponder(self)
+        registerForDraggedTypes(ImagePasteboard.dropTypes)
         // Hover events come from our tracking area (inside the canvas only). Don't set
         // window.acceptsMouseMovedEvents: that routes *every* mouse move to the first responder,
         // even over the toolbar or outside the window, which made the pen cursor stick everywhere.
@@ -161,11 +190,13 @@ final class CanvasView: NSView {
             self?.spaceKeyDown = false
         }
 
-        if dotGridObserver == nil {
-            dotGridObserver = NotificationCenter.default.addObserver(
-                forName: Self.dotGridDidChange, object: nil, queue: .main
-            ) { [weak self] _ in
-                self?.needsDisplay = true
+        if displayObservers.isEmpty {
+            // Display options, and AI settings (the page size) for the 显示分块 overlay.
+            displayObservers = [Self.displayOptionsDidChange, AISettings.didChange].map { name in
+                NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                    self?.layoutOverlay = nil
+                    self?.needsDisplay = true
+                }
             }
         }
 
@@ -181,7 +212,7 @@ final class CanvasView: NSView {
     deinit {
         if let monitor = proximityMonitor { NSEvent.removeMonitor(monitor) }
         if let observer = resignKeyObserver { NotificationCenter.default.removeObserver(observer) }
-        if let observer = dotGridObserver { NotificationCenter.default.removeObserver(observer) }
+        displayObservers.forEach(NotificationCenter.default.removeObserver)
     }
 
     override func updateTrackingAreas() {
@@ -196,8 +227,8 @@ final class CanvasView: NSView {
     // MARK: - Document API
 
     /// Replaces the content without undo (used when opening the saved board).
-    func load(_ newStrokes: [Stroke]) {
-        strokes = newStrokes
+    func load(_ newBoard: Board) {
+        board = newBoard
         selection = []
         undoManager?.removeAllActions(withTarget: self)
         ensureCanvasSize()
@@ -205,22 +236,118 @@ final class CanvasView: NSView {
     }
 
     func clearAll() {
-        guard !strokes.isEmpty else { return }
+        guard !board.isEmpty else { return }
         selection = []
-        apply([], actionName: "清空画布")
+        apply(Board(), actionName: "清空画布")
     }
 
     func deleteSelection() {
         guard !selection.isEmpty else { return }
         let ids = selection
         selection = []
-        apply(strokes.filter { !ids.contains($0.id) }, actionName: "删除")
+        apply(board.removing(ids), actionName: "删除")
     }
 
     override func selectAll(_ sender: Any?) {
         tool = .lasso
-        selection = Set(strokes.map(\.id))
+        selection = board.ids
         needsDisplay = true
+    }
+
+    // MARK: - Pictures
+
+    /// Smallest side a picture can be resized to, in screen points.
+    private static let minImageScreenSide: CGFloat = 16
+    /// Corner handles of a selected picture, in screen points.
+    private static let handleScreenSize: CGFloat = 8
+
+    @objc func paste(_ sender: Any?) {
+        if !insertImages(from: .general) { NSSound.beep() }
+    }
+
+    /// Inserts the pictures on `pasteboard`, centred on `center` (default: the middle of the view).
+    @discardableResult
+    func insertImages(from pasteboard: NSPasteboard, centeredAt center: CGPoint? = nil) -> Bool {
+        insertImages(ImagePasteboard.imageData(from: pasteboard), centeredAt: center)
+    }
+
+    /// Adds pictures as one undoable step. Each comes in at its natural size, scaled down to fit
+    /// in the visible area; several are cascaded. They end up selected with the lasso tool, so
+    /// they can be moved or resized right away. Returns false when none of the data is an image.
+    @discardableResult
+    func insertImages(_ datas: [Data], centeredAt center: CGPoint? = nil) -> Bool {
+        let prepared = datas.compactMap { ImageImport.prepare($0) }
+        let visible = visibleRect.isEmpty ? CGRect(x: 0, y: 0, width: 1200, height: 800) : visibleRect
+        let fit = CGSize(width: visible.width * 0.8, height: visible.height * 0.8)
+        let step = 24 / magnification
+        var center = center ?? CGPoint(x: visible.midX, y: visible.midY)
+
+        var added: [BoardImage] = []
+        for item in prepared {
+            let scale = min(1, fit.width / item.size.width, fit.height / item.size.height)
+            let size = CGSize(width: item.size.width * scale, height: item.size.height * scale)
+            let origin = CGPoint(x: max(0, center.x - size.width / 2), y: max(0, center.y - size.height / 2))
+            if let image = BoardImage(data: item.data, frame: CGRect(origin: origin, size: size)) {
+                added.append(image)
+                center.x += step
+                center.y += step
+            }
+        }
+        guard !added.isEmpty else { return false }
+
+        var next = board
+        next.images += added
+        tool = .lasso
+        selection = Set(added.map(\.id))
+        apply(next, actionName: "插入图片")
+        return true
+    }
+
+    /// The selected picture when it is the whole selection: it gets corner handles for resizing.
+    private var resizableImage: BoardImage? {
+        guard selection.count == 1, let id = selection.first else { return nil }
+        return board.images.first { $0.id == id }
+    }
+
+    private func resizeCorner(at point: CGPoint) -> InkOps.Corner? {
+        guard let image = resizableImage else { return nil }
+        let reach = Self.handleScreenSize / magnification
+        return InkOps.Corner.allCases.first { corner in
+            let c = corner.point(in: image.frame)
+            return abs(point.x - c.x) <= reach && abs(point.y - c.y) <= reach
+        }
+    }
+
+    /// Where a picture is drawn right now: following a move, insert-space or resize gesture.
+    private func displayFrame(of image: BoardImage) -> CGRect {
+        switch gesture {
+        case .resize(let session) where session.id == image.id:
+            return session.frame
+        case .move(let session) where selection.contains(image.id):
+            return image.frame.offsetBy(dx: session.offset.dx, dy: session.offset.dy)
+        case .insertSpace(let session) where session.ids.contains(image.id):
+            return image.frame.offsetBy(dx: 0, dy: session.delta)
+        default:
+            return image.frame
+        }
+    }
+
+    // MARK: - Drag & drop (pictures)
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        ImagePasteboard.canRead(sender.draggingPasteboard) ? .copy : []
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        let point = convert(sender.draggingLocation, from: nil)
+        return insertImages(from: sender.draggingPasteboard, centeredAt: point)
+    }
+
+    /// Replaces the board's labels (see BlockLabeling) as one undoable step.
+    func setLabels(_ labels: [Set<UUID>: InkBlock.Kind]) {
+        var next = board
+        next.labels = labels
+        apply(next, actionName: "识别分块类型")
     }
 
     @objc func delete(_ sender: Any?) {
@@ -264,12 +391,15 @@ final class CanvasView: NSView {
 
         case .eraser:
             clearSelection()
-            var session = EraseSession(before: strokes, last: p)
+            var session = EraseSession(before: board, last: p)
             erase(from: p, to: p, session: &session)
             gesture = .erase(session)
 
         case .lasso:
-            if !selection.isEmpty, selectionFrame.contains(p) {
+            if let image = resizableImage, let corner = resizeCorner(at: p) {
+                gesture = .resize(ResizeSession(id: image.id, original: image.frame, corner: corner, frame: image.frame))
+                Self.resizeCursor(for: corner).set()
+            } else if !selection.isEmpty, selectionFrame.contains(p) {
                 gesture = .move(MoveSession(start: p))
                 NSCursor.closedHand.set()
             } else {
@@ -279,12 +409,11 @@ final class CanvasView: NSView {
 
         case .insertSpace:
             clearSelection()
-            let ids = InkOps.strokesBelow(p.y, in: strokes)
-            let moving = strokes.filter { ids.contains($0.id) }
+            let ids = InkOps.itemsBelow(p.y, in: board)
             gesture = .insertSpace(SpaceSession(
                 lineY: p.y, ids: ids,
-                minDelta: InkOps.minimumSpaceDelta(lineY: p.y, moving: ids, in: strokes),
-                movingBounds: moving.unionBounds))
+                minDelta: InkOps.minimumSpaceDelta(lineY: p.y, moving: ids, in: board),
+                movingBounds: board.bounds(of: ids)))
             setNeedsDisplay(visibleRect)
         }
     }
@@ -316,6 +445,15 @@ final class CanvasView: NSView {
             self.gesture = .move(session)
             let new = selectionFrame.offsetBy(dx: session.offset.dx, dy: session.offset.dy)
             setNeedsDisplay(old.union(new).insetBy(dx: -4, dy: -4))
+            autoscroll(with: event)
+
+        case .resize(var session):
+            let old = session.frame
+            session.frame = InkOps.resize(session.original, dragging: session.corner, to: p,
+                                          minSide: Self.minImageScreenSide / magnification)
+            self.gesture = .resize(session)
+            let pad = Self.handleScreenSize / magnification + 2
+            setNeedsDisplay(old.union(session.frame).insetBy(dx: -pad, dy: -pad))
             autoscroll(with: event)
 
         case .insertSpace(var session):
@@ -351,7 +489,9 @@ final class CanvasView: NSView {
             guard !points.isEmpty else { return }
             let stroke = Stroke(points: points, width: live.width)
             setNeedsDisplay(stroke.bounds.union(live.tailRect).insetBy(dx: -2, dy: -2))
-            apply(strokes + [stroke], actionName: "书写")
+            var next = board
+            next.strokes.append(stroke)
+            apply(next, actionName: "书写")
 
         case .erase(let session):
             if session.changed {
@@ -362,23 +502,32 @@ final class CanvasView: NSView {
         case .lasso(let points):
             let area = InkOps.boundingRect(of: points)
             if max(area.width, area.height) * magnification < 4 {
-                // A tap selects the stroke under the pointer.
-                let hit = InkOps.hitTest(points[0], in: strokes, tolerance: 4 / magnification)
+                // A tap selects the stroke (or else the picture) under the pointer.
+                let hit = InkOps.hitTest(points[0], in: board, tolerance: 4 / magnification)
                 selection = hit.map { [$0] } ?? []
             } else {
-                selection = InkOps.strokes(inLasso: points, from: strokes)
+                selection = InkOps.selection(inLasso: points, in: board)
             }
             setNeedsDisplay(area.union(selectionFrame).insetBy(dx: -8, dy: -8))
 
         case .move(let session):
             if session.offset != .zero {
-                apply(InkOps.translate(strokes, ids: selection, dx: session.offset.dx, dy: session.offset.dy),
+                apply(InkOps.translate(board, ids: selection, dx: session.offset.dx, dy: session.offset.dy),
                       actionName: "移动")
+            }
+
+        case .resize(let session):
+            let pad = Self.handleScreenSize / magnification + 2
+            setNeedsDisplay(session.original.union(session.frame).insetBy(dx: -pad, dy: -pad))
+            if session.frame != session.original, let i = board.images.firstIndex(where: { $0.id == session.id }) {
+                var next = board
+                next.images[i].frame = session.frame
+                apply(next, actionName: "调整图片大小")
             }
 
         case .insertSpace(let session):
             if session.delta != 0, !session.ids.isEmpty {
-                apply(InkOps.translate(strokes, ids: session.ids, dx: 0, dy: session.delta),
+                apply(InkOps.translate(board, ids: session.ids, dx: 0, dy: session.delta),
                       actionName: session.delta > 0 ? "插入空间" : "删除空间")
             }
             setNeedsDisplay(visibleRect)
@@ -471,8 +620,8 @@ final class CanvasView: NSView {
 
     private func erase(from a: CGPoint, to b: CGPoint, session: inout EraseSession) {
         let radius = Self.eraserScreenRadius / magnification
-        guard let result = InkOps.erase(strokes, from: a, to: b, radius: radius) else { return }
-        strokes = result.strokes
+        guard let result = InkOps.erase(board.strokes, from: a, to: b, radius: radius) else { return }
+        board.strokes = result.strokes
         session.changed = true
         setNeedsDisplay(result.dirty.insetBy(dx: -2, dy: -2))
     }
@@ -532,21 +681,21 @@ final class CanvasView: NSView {
 
     // MARK: - Undo & canvas size
 
-    /// Commits a new stroke list as one undoable step.
-    private func apply(_ newStrokes: [Stroke], actionName: String) {
-        let old = strokes
-        strokes = newStrokes
+    /// Commits a new board as one undoable step.
+    private func apply(_ newBoard: Board, actionName: String) {
+        let old = board
+        board = newBoard
         setNeedsDisplay(visibleRect)
         registerUndo(restoring: old, actionName: actionName)
         contentDidChange()
     }
 
-    private func registerUndo(restoring old: [Stroke], actionName: String) {
+    private func registerUndo(restoring old: Board, actionName: String) {
         guard let undoManager else { return }
         undoManager.registerUndo(withTarget: self) { view in
-            let current = view.strokes
-            view.strokes = old
-            view.selection = view.selection.intersection(old.map(\.id))
+            let current = view.board
+            view.board = old
+            view.selection = view.selection.intersection(old.ids)
             view.setNeedsDisplay(view.visibleRect)
             view.registerUndo(restoring: current, actionName: actionName)   // becomes the redo
             view.contentDidChange()
@@ -556,12 +705,13 @@ final class CanvasView: NSView {
 
     private func contentDidChange() {
         ensureCanvasSize()
+        if Self.showsBlocks { setNeedsDisplay(visibleRect) }   // blocks can change anywhere
         onContentChange?()
     }
 
-    /// Grows the canvas so there is always room to keep writing right and below the ink.
+    /// Grows the canvas so there is always room to keep writing right and below the content.
     private func ensureCanvasSize() {
-        let content = strokes.unionBounds
+        let content = board.bounds
         var size = frame.size
         size.width = max(size.width, Self.minimumCanvasSize.width, content.isNull ? 0 : content.maxX + Self.canvasMargin)
         size.height = max(size.height, Self.minimumCanvasSize.height, content.isNull ? 0 : content.maxY + Self.canvasMargin)
@@ -571,7 +721,7 @@ final class CanvasView: NSView {
     // MARK: - Drawing
 
     private var selectionBounds: CGRect {
-        strokes.lazy.filter { self.selection.contains($0.id) }.reduce(CGRect.null) { $0.union($1.bounds) }
+        board.bounds(of: selection)
     }
 
     /// The dashed frame around the selection; dragging inside it moves the selection.
@@ -588,6 +738,12 @@ final class CanvasView: NSView {
         ctx.setFillColor(CGColor(gray: 1, alpha: 1))
         ctx.fill(dirtyRect)
         if Self.showsDotGrid { drawDotGrid(in: dirtyRect, ctx: ctx, magnification: mag) }
+
+        // Pictures, under all ink.
+        for image in board.images {
+            let frame = displayFrame(of: image)
+            if frame.intersects(dirtyRect) { InkRenderer.draw(image.image, in: frame, ctx: ctx) }
+        }
 
         var moving: Set<UUID> = []
         var movingOffset = CGVector.zero
@@ -616,16 +772,28 @@ final class CanvasView: NSView {
             ctx.restoreGState()
         }
 
-        // Selection: accent-coloured ink plus a dashed frame, following a drag.
+        // Selection: accent-coloured ink, outlined pictures and a dashed frame, following a drag.
+        // A lone picture gets corner handles for resizing instead of the frame.
         if !selection.isEmpty {
             ctx.saveGState()
             if case .move = gesture { ctx.translateBy(x: movingOffset.dx, y: movingOffset.dy) }
             InkRenderer.fill(strokes.filter { selection.contains($0.id) }, in: ctx, color: accent)
-            let frame = selectionFrame
             ctx.setStrokeColor(accent)
-            ctx.setLineWidth(1 / mag)
-            ctx.setLineDash(phase: 0, lengths: [5 / mag, 4 / mag])
-            ctx.stroke(frame)
+            ctx.setLineWidth(2 / mag)
+            for image in board.images where selection.contains(image.id) {
+                let frame: CGRect
+                if case .resize(let session) = gesture, session.id == image.id { frame = session.frame } else { frame = image.frame }
+                ctx.stroke(frame.insetBy(dx: -1 / mag, dy: -1 / mag))
+            }
+            if let image = resizableImage {
+                let frame: CGRect
+                if case .resize(let session) = gesture { frame = session.frame } else { frame = image.frame }
+                drawHandles(around: frame, ctx: ctx, accent: accent, magnification: mag)
+            } else {
+                ctx.setLineWidth(1 / mag)
+                ctx.setLineDash(phase: 0, lengths: [5 / mag, 4 / mag])
+                ctx.stroke(selectionFrame)
+            }
             ctx.restoreGState()
         }
 
@@ -670,6 +838,71 @@ final class CanvasView: NSView {
         if gesture == nil, !isCapturingFormula, activeTool == .insertSpace, let hover = mouseLocation {
             drawHorizontalLine(at: hover.y, ctx: ctx, color: accent, width: 1 / mag, dashed: [6 / mag, 4 / mag])
         }
+
+        if Self.showsBlocks { drawLayoutOverlay(ctx: ctx, magnification: mag) }
+    }
+
+    // MARK: - 显示分块 overlay
+
+    private func drawLayoutOverlay(ctx: CGContext, magnification mag: CGFloat) {
+        if layoutOverlay == nil {
+            let blocks = InkLayout.analyze(board).blocks
+            layoutOverlay = (blocks, PageAssembler.pages(for: blocks, options: AISettings.current.pageOptions))
+        }
+        guard let overlay = layoutOverlay else { return }
+
+        ctx.saveGState()
+        let grey = CGColor(gray: 0.45, alpha: 0.9)
+        for (i, page) in overlay.pages.enumerated() {
+            ctx.setStrokeColor(grey)
+            ctx.setLineWidth(1 / mag)
+            ctx.setLineDash(phase: 0, lengths: [8 / mag, 5 / mag])
+            ctx.stroke(page.rect)
+            ctx.setLineDash(phase: 0, lengths: [])
+            drawTag("第 \(i + 1) 页", at: CGPoint(x: page.rect.maxX, y: page.rect.minY), alignRight: true,
+                    color: grey, magnification: mag)
+        }
+        for (i, block) in overlay.blocks.enumerated() {
+            drawBlockOutline(block, label: "\(i + 1)", dashed: false, ctx: ctx, magnification: mag)
+            for (j, child) in block.children.enumerated() {
+                drawBlockOutline(child, label: "\(i + 1).\(j + 1)", dashed: true, ctx: ctx, magnification: mag)
+            }
+        }
+        ctx.restoreGState()
+    }
+
+    private func drawBlockOutline(_ block: InkBlock, label: String, dashed: Bool, ctx: CGContext, magnification mag: CGFloat) {
+        let color = block.kind.overlayColor
+        let frame = block.bounds.insetBy(dx: -3 / mag, dy: -3 / mag)
+        ctx.setFillColor(color.copy(alpha: 0.07) ?? color)
+        ctx.fill(frame)
+        ctx.setStrokeColor(color.copy(alpha: 0.35) ?? color)
+        ctx.setLineWidth(0.75 / mag)
+        for line in block.lines { ctx.stroke(line.bounds) }
+        ctx.setStrokeColor(color)
+        ctx.setLineWidth(1.5 / mag)
+        if dashed { ctx.setLineDash(phase: 0, lengths: [4 / mag, 3 / mag]) }
+        ctx.stroke(frame)
+        ctx.setLineDash(phase: 0, lengths: [])
+        drawTag("\(label) \(block.kind.title)", at: CGPoint(x: frame.minX, y: frame.minY), alignRight: false,
+                color: color, magnification: mag)
+    }
+
+    /// A small label sitting on top of a frame's corner; constant size on screen.
+    private func drawTag(_ text: String, at corner: CGPoint, alignRight: Bool, color: CGColor, magnification mag: CGFloat) {
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 10 / mag, weight: .medium),
+            .foregroundColor: NSColor.white,
+        ]
+        let string = NSAttributedString(string: text, attributes: attributes)
+        let size = string.size()
+        let padX = 3 / mag, padY = 1 / mag
+        let width = size.width + 2 * padX, height = size.height + 2 * padY
+        var tag = CGRect(x: alignRight ? corner.x - width : corner.x, y: corner.y - height, width: width, height: height)
+        if tag.minY < bounds.minY { tag.origin.y = corner.y }   // no room above: inside the frame
+        NSColor(cgColor: color)?.setFill()
+        NSBezierPath(roundedRect: tag, xRadius: 2 / mag, yRadius: 2 / mag).fill()
+        string.draw(at: CGPoint(x: tag.minX + padX, y: tag.minY + padY))
     }
 
     private func drawDotGrid(in rect: CGRect, ctx: CGContext, magnification mag: CGFloat) {
@@ -713,6 +946,22 @@ final class CanvasView: NSView {
         ctx.move(to: CGPoint(x: visible.minX, y: y))
         ctx.addLine(to: CGPoint(x: visible.maxX, y: y))
         ctx.strokePath()
+        ctx.restoreGState()
+    }
+
+    private func drawHandles(around frame: CGRect, ctx: CGContext, accent: CGColor, magnification mag: CGFloat) {
+        let side = Self.handleScreenSize / mag
+        ctx.saveGState()
+        ctx.setLineDash(phase: 0, lengths: [])
+        ctx.setLineWidth(1 / mag)
+        ctx.setFillColor(CGColor(gray: 1, alpha: 1))
+        ctx.setStrokeColor(accent)
+        for corner in InkOps.Corner.allCases {
+            let c = corner.point(in: frame)
+            let handle = CGRect(x: c.x - side / 2, y: c.y - side / 2, width: side, height: side)
+            ctx.fill(handle)
+            ctx.stroke(handle)
+        }
         ctx.restoreGState()
     }
 
@@ -769,7 +1018,24 @@ final class CanvasView: NSView {
     }
 
     private static var canvasCursors: [NSCursor] {
-        [penCursor, eraserCursor, .crosshair, .resizeUpDown, .openHand, .closedHand]
+        [penCursor, eraserCursor, .crosshair, .resizeUpDown, .openHand, .closedHand,
+         diagonalResizeCursors.down, diagonalResizeCursors.up]
+    }
+
+    /// ↖↘ and ↗↙ cursors for picture corner handles (macOS 15+; a crosshair before that).
+    private static let diagonalResizeCursors: (down: NSCursor, up: NSCursor) = {
+        if #available(macOS 15, *) {
+            return (NSCursor.frameResize(position: .topLeft, directions: .all),
+                    NSCursor.frameResize(position: .topRight, directions: .all))
+        }
+        return (.crosshair, .crosshair)
+    }()
+
+    private static func resizeCursor(for corner: InkOps.Corner) -> NSCursor {
+        switch corner {
+        case .topLeft, .bottomRight: return diagonalResizeCursors.down
+        case .topRight, .bottomLeft: return diagonalResizeCursors.up
+        }
     }
 
     private func cursor(at point: CGPoint?) -> NSCursor {
@@ -781,6 +1047,7 @@ final class CanvasView: NSView {
         case .eraser:
             return Self.eraserCursor
         case .lasso:
+            if let point, let corner = resizeCorner(at: point) { return Self.resizeCursor(for: corner) }
             if let point, !selection.isEmpty, selectionFrame.contains(point) { return .openHand }
             return .crosshair
         case .insertSpace:
@@ -819,8 +1086,33 @@ extension CanvasView: NSMenuItemValidation {
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         switch menuItem.action {
         case #selector(delete(_:)): return !selection.isEmpty
-        case #selector(selectAll(_:)): return !strokes.isEmpty
+        case #selector(selectAll(_:)): return !board.isEmpty
+        case #selector(paste(_:)): return ImagePasteboard.canRead(.general)
         default: return true
+        }
+    }
+}
+
+private extension InkBlock.Kind {
+    var title: String {
+        switch self {
+        case .text: return "文字"
+        case .formula: return "公式"
+        case .drawing: return "手绘图"
+        case .diagram: return "示意图"
+        case .image: return "图片"
+        case .figure: return "图片+墨迹"
+        }
+    }
+
+    var overlayColor: CGColor {
+        switch self {
+        case .text: return CGColor(srgbRed: 0.24, green: 0.47, blue: 0.85, alpha: 1)
+        case .formula: return CGColor(srgbRed: 0.58, green: 0.32, blue: 0.85, alpha: 1)
+        case .drawing: return CGColor(srgbRed: 0.93, green: 0.52, blue: 0.12, alpha: 1)
+        case .diagram: return CGColor(srgbRed: 0.18, green: 0.62, blue: 0.33, alpha: 1)
+        case .image: return CGColor(srgbRed: 0.08, green: 0.58, blue: 0.68, alpha: 1)
+        case .figure: return CGColor(srgbRed: 0.85, green: 0.28, blue: 0.5, alpha: 1)
         }
     }
 }

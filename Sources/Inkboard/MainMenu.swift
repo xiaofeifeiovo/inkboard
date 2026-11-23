@@ -44,6 +44,8 @@ enum MainMenu {
             menu.addItem(.separator())
             menu.addItem(withTitle: "导出 PNG…", action: #selector(MainWindowController.exportPNG(_:)), keyEquivalent: "e")
                 .keyEquivalentModifierMask = [.command, .shift]
+            menu.addItem(withTitle: "导出 PDF…", action: #selector(MainWindowController.exportPDF(_:)), keyEquivalent: "e")
+                .keyEquivalentModifierMask = [.command, .shift, .option]
             menu.addItem(.separator())
             menu.addItem(withTitle: "清空画布", action: #selector(MainWindowController.clearBoard(_:)), keyEquivalent: "")
         }
@@ -52,6 +54,12 @@ enum MainMenu {
             menu.addItem(withTitle: "撤销", action: Selector(("undo:")), keyEquivalent: "z")
             menu.addItem(withTitle: "重做", action: Selector(("redo:")), keyEquivalent: "z")
                 .keyEquivalentModifierMask = [.command, .shift]
+            menu.addItem(.separator())
+            // Standard items (text fields in 设置 need them too). The canvas only pastes pictures.
+            menu.addItem(withTitle: "剪切", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+            menu.addItem(withTitle: "拷贝", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+            menu.addItem(withTitle: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+            menu.addItem(withTitle: "插入图片…", action: #selector(MainWindowController.insertImage(_:)), keyEquivalent: "")
             menu.addItem(.separator())
             menu.addItem(withTitle: "全选", action: #selector(CanvasView.selectAll(_:)), keyEquivalent: "a")
             menu.addItem(withTitle: "删除所选（⌫）", action: #selector(CanvasView.delete(_:)), keyEquivalent: "")
@@ -80,6 +88,7 @@ enum MainMenu {
                 .keyEquivalentModifierMask = [.command, .shift]
             menu.addItem(withTitle: "全局转换：画板 → Markdown", action: #selector(MainWindowController.convertDocument(_:)), keyEquivalent: "m")
                 .keyEquivalentModifierMask = [.command, .shift]
+            menu.addItem(withTitle: "识别分块类型（文字 / 公式 / 图）", action: #selector(MainWindowController.labelBlocks(_:)), keyEquivalent: "")
             menu.addItem(.separator())
             menu.addItem(withTitle: "AI 设置…", action: #selector(AppDelegate.showSettings(_:)), keyEquivalent: "")
         }
@@ -90,6 +99,7 @@ enum MainMenu {
             menu.addItem(withTitle: "实际大小", action: #selector(MainWindowController.actualSize(_:)), keyEquivalent: "0")
             menu.addItem(.separator())
             menu.addItem(withTitle: "显示点格", action: #selector(AppDelegate.toggleDotGrid(_:)), keyEquivalent: "")
+            menu.addItem(withTitle: "显示分块", action: #selector(AppDelegate.toggleBlocks(_:)), keyEquivalent: "")
             menu.addItem(.separator())
             menu.addItem(withTitle: "进入全屏幕", action: #selector(NSWindow.toggleFullScreen(_:)), keyEquivalent: "f")
                 .keyEquivalentModifierMask = [.command, .control]
