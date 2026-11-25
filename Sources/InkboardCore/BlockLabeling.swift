@@ -78,11 +78,14 @@ public enum BlockLabeling {
         return units
     }
 
-    /// Segments the board and renders its pages with every unit marked.
-    public static func request(for board: Board, options: PageAssembler.Options) -> Request {
+    /// Segments the board and renders its pages with every unit marked. `layout`: pass the
+    /// options taken on the main thread when called from another thread (分块方式 lives in
+    /// `InkLayout.defaultOptions`, which the app changes on the main thread).
+    public static func request(for board: Board, options: PageAssembler.Options,
+                               layout: InkLayout.Options = InkLayout.defaultOptions) -> Request {
         var options = options
         options.padding = max(options.padding, 40)   // room for the tags left of the lines
-        let blocks = InkLayout.analyze(board).blocks
+        let blocks = InkLayout.analyze(board, options: layout).blocks
         let units = units(in: blocks)
         let pages = PageAssembler.pages(for: blocks, options: options).compactMap { page -> InkImage? in
             let ids = page.ids

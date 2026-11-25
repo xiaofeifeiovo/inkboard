@@ -30,6 +30,11 @@ struct AISettings: Equatable {
     var apiFormulaThoughtLevel = ""
     var apiDocumentModel = ""
     var apiDocumentThoughtLevel = ""
+    // 自动检查: empty model = the 全局转换 model and thinking level.
+    var checkModel = ""
+    var checkThoughtLevel = ""
+    var apiCheckModel = ""
+    var apiCheckThoughtLevel = ""
 
     static let maxImagePixelsRange = 800...4000
 
@@ -73,6 +78,10 @@ struct AISettings: Equatable {
         ("ai.api.formula.thoughtLevel", \.apiFormulaThoughtLevel),
         ("ai.api.document.model", \.apiDocumentModel),
         ("ai.api.document.thoughtLevel", \.apiDocumentThoughtLevel),
+        ("ai.check.model", \.checkModel),
+        ("ai.check.thoughtLevel", \.checkThoughtLevel),
+        ("ai.api.check.model", \.apiCheckModel),
+        ("ai.api.check.thoughtLevel", \.apiCheckThoughtLevel),
     ]
     private static let backendKey = "ai.backend"
     private static let maxImagePixelsKey = "ai.document.maxImagePixels"
@@ -157,6 +166,30 @@ struct AISettings: Equatable {
         set { if backend == .openAI { apiDocumentThoughtLevel = newValue } else { documentThoughtLevel = newValue } }
     }
 
+    /// 自动检查's own model; empty means 「与全局转换相同」.
+    var activeCheckModel: String {
+        get { backend == .openAI ? apiCheckModel : checkModel }
+        set { if backend == .openAI { apiCheckModel = newValue } else { checkModel = newValue } }
+    }
+    var activeCheckThoughtLevel: String {
+        get { backend == .openAI ? apiCheckThoughtLevel : checkThoughtLevel }
+        set { if backend == .openAI { apiCheckThoughtLevel = newValue } else { checkThoughtLevel = newValue } }
+    }
+
+    /// The model and thinking level 自动检查 uses (its own, or 全局转换's when none is chosen).
+    var checkProfile: TranscriptionProfile? {
+        activeCheckModel.isEmpty ? nil
+            : TranscriptionProfile(model: activeCheckModel, thoughtLevel: activeCheckThoughtLevel, prompt: documentPrompt)
+    }
+
+    /// Changes when a 自动检查 conversation can't go on: another backend, agent, API or model.
+    var checkSignature: String {
+        let profile = checkProfile
+        return [backend.rawValue, catalogSource,
+                profile?.model ?? activeDocumentModel, profile?.thoughtLevel ?? activeDocumentThoughtLevel]
+            .joined(separator: "\n")
+    }
+
     func agentConfiguration() throws -> ACPAgentConfiguration {
         guard let executable = ACPAgentConfiguration.locate(command) else {
             throw AISettingsError.agentNotFound(command)
@@ -187,7 +220,8 @@ struct AISettings: Equatable {
         AITranscriberSettings(
             backend: try backendConfiguration(),
             formula: TranscriptionProfile(model: activeFormulaModel, thoughtLevel: activeFormulaThoughtLevel, prompt: formulaPrompt),
-            document: TranscriptionProfile(model: activeDocumentModel, thoughtLevel: activeDocumentThoughtLevel, prompt: documentPrompt))
+            document: TranscriptionProfile(model: activeDocumentModel, thoughtLevel: activeDocumentThoughtLevel, prompt: documentPrompt),
+            check: checkProfile)
     }
 }
 

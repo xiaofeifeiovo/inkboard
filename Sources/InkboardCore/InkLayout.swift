@@ -98,11 +98,18 @@ public enum InkLayout {
     public struct Options {
         /// Typical height of a written word; nil estimates it from the ink.
         public var textHeight: CGFloat?
+        /// Follow `Board.groups` (分块方式「AI 辅助」). Off: geometry only (groups are ignored).
+        public var useGroups: Bool
 
-        public init(textHeight: CGFloat? = nil) {
+        public init(textHeight: CGFloat? = nil, useGroups: Bool = false) {
             self.textHeight = textHeight
+            self.useGroups = useGroups
         }
     }
+
+    /// What `analyze` uses when no options are passed. The app sets `useGroups` from 设置 →
+    /// 分块方式, so every caller (canvas, 全局转换, PDF, 自动检查) segments the same way.
+    public static var defaultOptions = Options()
 
     public struct Result {
         /// Top-level blocks in reading order.
@@ -111,9 +118,9 @@ public enum InkLayout {
         public var textHeight: CGFloat
     }
 
-    public static func analyze(_ board: Board, options: Options = Options()) -> Result {
+    public static func analyze(_ board: Board, options: Options = InkLayout.defaultOptions) -> Result {
         let h = options.textHeight ?? estimateTextHeight(board.strokes)
-        let blocks = Analyzer(board: board, h: h).run()
+        let blocks = Analyzer(board: board, h: h).run(useGroups: options.useGroups)
         return Result(blocks: blocks, textHeight: h)
     }
 
@@ -219,6 +226,7 @@ private final class Analyzer {
     var length: [CGFloat] = []
     var straight: [Bool] = []
     var role: [Role] = []
+    var operators = Set<Int>()
     var isFractionBar: [Bool]
     var isEquals: [Bool]
     /// Glyphs: strokes glued into characters / words / fraction units.
@@ -265,9 +273,10 @@ private final class Analyzer {
         glyphBounds = bounds
     }
 
-    func run() -> [InkBlock] {
+    func run(useGroups: Bool) -> [InkBlock] {
         findEqualsSigns()
         resolveRules()
+        resolveTallOperators()
         buildGlyphs()
         let lines = buildLines()
         var drawings = buildDrawings()
@@ -278,6 +287,9 @@ private final class Analyzer {
         var blocks = paragraphs(free, gap: paragraphGap).map(textBlock)
         blocks += drawings.map(drawingBlock)
         blocks += figures.map { figureBlock($0, paragraphGap: paragraphGap) }
+        if useGroups && !board.groups.isEmpty {
+            return groupedBlocks(blocks)
+        }
         return ordered(blocks)
     }
 
@@ -362,6 +374,38 @@ private final class Analyzer {
         }
     }
 
+    /// A tall open pen stroke alongside writing can be an operator. Leave connected
+    /// graphics (axes, arrows, multi-stroke frames) together for drawing recognition.
+    func resolveTallOperators() {
+        let graphics = bounds.indices.filter { role[$0] == .graphic }
+        guard !graphics.isEmpty else { return }
+        var grid = RectGrid(cell: 3 * h)
+        for i in bounds.indices { grid.insert(i, bounds[i]) }
+        for i in graphics {
+            let r = bounds[i]
+            guard r.height > 2.4 * h, r.width <= 1.2 * r.height,
+                  let a = samples[i].first, let b = samples[i].last,
+                  hypot(a.x - b.x, a.y - b.y) > 0.6 * h else { continue }
+            let nearby = grid.query(r.insetBy(dx: -1.5 * h, dy: -0.5 * h)).filter { $0 != i }
+            let touchesGraphic = nearby.contains { j in
+                role[j] == .graphic && InkLayout.gap(r, bounds[j]) <= 0.5 * h && distance([i], [j]) <= 0.5 * h
+            }
+            if touchesGraphic { continue }
+            let neighbours = nearby.filter { j in
+                let t = bounds[j]
+                let overlap = min(r.maxY, t.maxY) - max(r.minY, t.minY)
+                return role[j] != .graphic && overlap >= 0.5 * t.height && InkLayout.gap(r, t) <= 1.5 * h
+            }
+            // A vertical separator alongside multiple baselines must not connect the rows.
+            let baselines = neighbours.filter { bounds[$0].height >= 0.6 * h }.map { bounds[$0].midY }
+            if let top = baselines.min(), let bottom = baselines.max(), bottom - top > 2 * h { continue }
+            if neighbours.contains(where: { abs(bounds[$0].midY - r.midY) <= max(h, 0.35 * r.height) }) {
+                operators.insert(i)
+            }
+        }
+        for i in operators { role[i] = .text }
+    }
+
     // MARK: Step 3: glyphs and lines
 
     @discardableResult
@@ -414,15 +458,45 @@ private final class Analyzer {
 
         var grid = RectGrid(cell: 2 * h)
         for (k, r) in rects.enumerated() { grid.insert(k, r) }
+        var graphics = RectGrid(cell: 3 * h)
+        for i in bounds.indices where role[i] == .graphic { graphics.insert(i, bounds[i]) }
+
+        // A column gutter repeats on adjacent rows. Look for writing on both sides of
+        // the same blank strip at a second baseline, using only the local grid cells.
+        func blocked(_ left: CGRect, _ right: CGRect) -> Bool {
+            let width = right.minX - left.maxX
+            guard width > 0 else { return false }
+            let strip = CGRect(x: left.maxX, y: max(left.minY, right.minY), width: width,
+                               height: min(left.maxY, right.maxY) - max(left.minY, right.minY))
+            // A box around both words has a bounding box across the gap, but its
+            // actual edges are outside the gap. Test the sampled segments themselves.
+            if graphics.query(strip).contains(where: { graphicIntersects($0, strip) }) { return true }
+            guard width >= h else { return false }
+            let band = strip.insetBy(dx: -1.5 * h, dy: -3.5 * h)
+            let neighbours = grid.query(band).map { rects[$0] }.filter {
+                $0.intersects(band) && abs($0.midY - strip.midY) >= h
+            }
+            let mid = strip.midX
+            let margin = 0.25 * h
+            let rightBank = neighbours.filter { $0.minX >= mid + margin }
+            let across = neighbours.filter { $0.minX < mid + margin && $0.maxX > mid - margin }
+            return neighbours.contains { a in
+                a.maxX <= mid - margin
+                    && !across.contains { $0.minY < a.midY + margin && $0.maxY > a.midY - margin }
+                    && rightBank.contains { abs(a.midY - $0.midY) <= 0.6 * h }
+            }
+        }
+
         var lines = UnionFind(roots.count)
         for (a, ra) in rects.enumerated() {
-            for b in grid.query(ra.insetBy(dx: -1.5 * h, dy: 0)) where b > a {
+            for b in grid.query(ra.insetBy(dx: -3 * h, dy: 0)) where b > a {
                 let rb = rects[b]
                 let overlap = min(ra.maxY, rb.maxY) - max(ra.minY, rb.minY)
                 let shorter = max(min(ra.height, rb.height), 1)
                 let gapX = max(ra.minX, rb.minX) - min(ra.maxX, rb.maxX)
                 let centres = abs(ra.midY - rb.midY)
-                if overlap >= 0.4 * shorter, gapX <= 1.5 * h, centres <= 0.75 * max(ra.height, rb.height) {
+                if overlap >= 0.4 * shorter, gapX <= 3 * h, centres <= 0.75 * max(ra.height, rb.height),
+                   !(ra.minX < rb.minX ? blocked(ra, rb) : blocked(rb, ra)) {
                     lines.union(a, b)
                 }
             }
@@ -449,7 +523,7 @@ private final class Analyzer {
             let strokes = group.flatMap { members[roots[$0]]! }.sorted()
             let hasFraction = strokes.contains { isFractionBar[$0] }
             let hasEquals = strokes.contains { isEquals[$0] }
-            let guess: InkBlock.Kind = hasFraction || hasEquals ? .formula : .text
+            let guess: InkBlock.Kind = hasFraction || hasEquals || strokes.contains(where: operators.contains) ? .formula : .text
             let label = board.labels[Set(strokes.map { board.strokes[$0].id })]
             return Line(strokes: strokes, bounds: rect, hasFraction: hasFraction, hasEquals: hasEquals,
                         kind: label == .text || label == .formula ? label! : guess)
@@ -544,7 +618,7 @@ private final class Analyzer {
     // MARK: Step 6: paragraphs
 
     /// Lines further apart than this start a new paragraph: well above the usual gap between
-    /// lines of this board, within [0.8h, 1.8h].
+    /// lines of this board, within [0.8h, 1.5h].
     func paragraphGap(_ lines: [Line]) -> CGFloat {
         var gaps: [CGFloat] = []
         for a in lines {
@@ -554,7 +628,7 @@ private final class Analyzer {
             if let nearest = below.min(), nearest >= -0.5 * h, nearest <= 3 * h { gaps.append(nearest) }
         }
         let typical = gaps.isEmpty ? 0.6 * h : InkLayout.median(gaps)
-        return min(max(1.7 * typical, 0.8 * h), 1.8 * h)
+        return min(max(1.7 * typical, 0.8 * h), 1.5 * h)
     }
 
     func overlapsHorizontally(_ a: CGRect, _ b: CGRect) -> Bool {
@@ -620,12 +694,24 @@ private final class Analyzer {
         return InkBlock(kind: looksLikeDiagram ? .diagram : .drawing, bounds: bounds, strokeIDs: ids(all))
     }
 
-    /// Every graphic point lies near the edge of the drawing's bounds.
+    /// Trace a closed contour, allowing pen lifts at the corners of a hand-drawn box.
     func isEnclosure(_ drawing: Drawing) -> Bool {
-        let r = drawing.graphicBounds
-        let limit = max(0.6 * h, 0.15 * min(r.width, r.height))
-        return drawing.graphic.allSatisfy { s in
-            samples[s].allSatisfy { p in min(p.x - r.minX, r.maxX - p.x, p.y - r.minY, r.maxY - p.y) <= limit }
+        var remaining = drawing.graphic
+        var contour = samples[remaining.removeFirst()]
+        let tolerance = 0.45 * h
+        func near(_ a: CGPoint, _ b: CGPoint) -> Bool { hypot(a.x - b.x, a.y - b.y) <= tolerance }
+        while !remaining.isEmpty {
+            let end = contour.last!
+            guard let next = remaining.firstIndex(where: { near(end, samples[$0].first!) || near(end, samples[$0].last!) }) else { return false }
+            let segment = samples[remaining.remove(at: next)]
+            contour += near(end, segment.first!) ? segment : Array(segment.reversed())
+        }
+        guard near(contour.first!, contour.last!) else { return false }
+        let path = CGMutablePath()
+        path.addLines(between: contour)
+        path.closeSubpath()
+        return drawing.labels.allSatisfy { line in
+            path.contains(CGPoint(x: line.bounds.midX, y: line.bounds.midY))
         }
     }
 
@@ -638,6 +724,64 @@ private final class Analyzer {
                         strokeIDs: ids(strokes),
                         imageIDs: figure.images.map { board.images[$0].id },
                         children: children)
+    }
+
+    /// Apply explicit membership within each image context. A geometric block votes for
+    /// the owner of its unclaimed ink; explicit strokes always retain their own group.
+    func groupedBlocks(_ original: [InkBlock]) -> [InkBlock] {
+        var owners: [UUID: Int] = [:]
+        for (g, group) in board.groups.enumerated() {
+            for id in group.ids where owners[id] == nil { owners[id] = g }
+        }
+        var index: [UUID: Int] = [:]
+        for (i, stroke) in board.strokes.enumerated() { index[stroke.id] = i }
+
+        func regroup(_ blocks: [InkBlock]) -> [InkBlock] {
+            var result: [InkBlock] = []
+            var ink: [Int: [Int]] = [:]
+            var lines: [Int: [InkLine]] = [:]
+            for var block in blocks {
+                if !block.imageIDs.isEmpty {
+                    block.children = regroup(block.children)
+                    result.append(block)
+                    continue
+                }
+                var votes: [Int: Int] = [:]
+                for id in block.strokeIDs {
+                    if let g = owners[id] { votes[g, default: 0] += 1 }
+                }
+                // Break ties in stored group order.
+                guard let winner = votes.max(by: { ($0.value, -$0.key) < ($1.value, -$1.key) })?.key else {
+                    result.append(block)
+                    continue
+                }
+                for id in block.strokeIDs {
+                    ink[owners[id] ?? winner, default: []].append(index[id]!)
+                }
+                // Preserve line boundaries within each group. A graphical unit relabelled
+                // as writing acts as a single line; frame strokes stay outside the text lines.
+                let sourceLines = block.lines.isEmpty
+                    ? [InkLine(bounds: block.bounds, strokeIDs: block.strokeIDs)] : block.lines
+                for line in sourceLines {
+                    for (g, ids) in Dictionary(grouping: line.strokeIDs, by: { owners[$0] ?? winner }) {
+                        let kind = board.groups[g].kind
+                        guard kind == .formula || kind == .text else { continue }
+                        let indices = ids.map { index[$0]! }
+                        lines[g, default: []].append(InkLine(bounds: indices.reduce(.null) { $0.union(bounds[$1]) },
+                            strokeIDs: ids, kind: kind, hasFraction: indices.contains { isFractionBar[$0] },
+                            hasEquals: indices.contains { isEquals[$0] }))
+                    }
+                }
+            }
+            for g in ink.keys.sorted() {
+                let strokes = ink[g]!
+                let fragments = lines[g] ?? []
+                result.append(InkBlock(kind: board.groups[g].kind, bounds: strokes.reduce(.null) { $0.union(bounds[$1]) },
+                    strokeIDs: ids(strokes), lines: InkLayout.readingOrder(fragments.map(\.bounds)).map { fragments[$0] }))
+            }
+            return ordered(result)
+        }
+        return regroup(original)
     }
 
     func ordered(_ blocks: [InkBlock]) -> [InkBlock] {
@@ -661,6 +805,22 @@ private final class Analyzer {
     }
 
     // MARK: Geometry
+
+    /// Clip each segment to the gap's vertical range, then compare its horizontal extent.
+    func graphicIntersects(_ i: Int, _ gap: CGRect) -> Bool {
+        guard bounds[i].intersects(gap) else { return false }
+        return zip(samples[i], samples[i].dropFirst()).contains { a, b in
+            if a.y == b.y {
+                return a.y >= gap.minY && a.y <= gap.maxY
+                    && max(a.x, b.x) >= gap.minX && min(a.x, b.x) <= gap.maxX
+            }
+            let t0 = (gap.minY - a.y) / (b.y - a.y), t1 = (gap.maxY - a.y) / (b.y - a.y)
+            let lo = max(0, min(t0, t1)), hi = min(1, max(t0, t1))
+            guard lo <= hi else { return false }
+            let x0 = a.x + lo * (b.x - a.x), x1 = a.x + hi * (b.x - a.x)
+            return max(x0, x1) >= gap.minX && min(x0, x1) <= gap.maxX
+        }
+    }
 
     /// Share of the strokes' sample points inside `rect`.
     func insideFraction(_ strokes: [Int], _ rect: CGRect) -> CGFloat {

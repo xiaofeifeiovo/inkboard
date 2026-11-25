@@ -53,6 +53,29 @@ final class CanvasView: NSView {
     var onToolChange: ((Tool) -> Void)?
     /// Called after every committed edit (and undo/redo) — used for autosave.
     var onContentChange: (() -> Void)?
+    /// Also called after every committed edit (and undo/redo), with the new stroke's id when the
+    /// edit was writing a stroke (自动检查 counts only writing as finishing a block).
+    var onBoardCommit: ((_ addedStroke: UUID?) -> Void)?
+
+    /// 自动检查 boxes and buttons (see AutoChecker.Mark). Only an overlay: never touches the ink.
+    var autoCheckMarks: [AutoChecker.Mark] = [] {
+        didSet { if autoCheckMarks != oldValue { setNeedsDisplay(visibleRect) } }
+    }
+    /// Blocks highlighted while 详情 is open (the block itself and its 相关 blocks).
+    var autoCheckHighlights: [(tag: String, rect: CGRect)] = [] {
+        didSet { setNeedsDisplay(visibleRect) }
+    }
+    /// A block picked in the 自动检查 menu: outlined, then faded out (`flashAutoCheckBlock`).
+    private(set) var autoCheckFlash: (rect: CGRect, alpha: CGFloat)? {
+        didSet { setNeedsDisplay(visibleRect) }
+    }
+    private var autoCheckFlashTimer: Timer?
+    /// A button of a mark was clicked; `rect` is the button (canvas coordinates).
+    var onAutoCheckAction: ((AutoCheckAction, AutoChecker.Mark, CGRect) -> Void)?
+
+    enum AutoCheckAction {
+        case details, dismiss, recheck, check
+    }
 
     /// 局部转换 mode: dragging draws a box instead of using the tool; each finished box is
     /// reported through `onFormulaCapture`. The box is only an overlay and never touches the ink.
@@ -159,8 +182,9 @@ final class CanvasView: NSView {
     private var proximityMonitor: Any?
     private var resignKeyObserver: NSObjectProtocol?
     private var displayObservers: [NSObjectProtocol] = []
-    /// Blocks and pages for 显示分块, computed when first drawn after a change.
-    private var layoutOverlay: (blocks: [InkBlock], pages: [InkPage])?
+    /// Blocks and pages for 显示分块, computed when first drawn after a change; `aiLabels`: the
+    /// labels ("3", "3.1") of blocks that come from an AI group.
+    private var layoutOverlay: (blocks: [InkBlock], pages: [InkPage], aiLabels: Set<String>)?
 
     // MARK: - NSView
 
@@ -191,8 +215,8 @@ final class CanvasView: NSView {
         }
 
         if displayObservers.isEmpty {
-            // Display options, and AI settings (the page size) for the 显示分块 overlay.
-            displayObservers = [Self.displayOptionsDidChange, AISettings.didChange].map { name in
+            // Display options, AI settings (the page size) and 分块方式 for the 显示分块 overlay.
+            displayObservers = [Self.displayOptionsDidChange, AISettings.didChange, LayoutSettings.didChange].map { name in
                 NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
                     self?.layoutOverlay = nil
                     self?.needsDisplay = true
@@ -350,6 +374,13 @@ final class CanvasView: NSView {
         apply(next, actionName: "识别分块类型")
     }
 
+    /// Replaces the board's AI groups (分块方式「AI 辅助」, see BlockSegmentation) as one undoable step.
+    func setGroups(_ groups: [BlockGroup]) {
+        var next = board
+        next.groups = groups
+        apply(next, actionName: "AI 识别分块")
+    }
+
     @objc func delete(_ sender: Any?) {
         deleteSelection()
     }
@@ -371,6 +402,13 @@ final class CanvasView: NSView {
         if spaceKeyDown {
             gesture = .pan(lastWindowPoint: event.locationInWindow)
             NSCursor.closedHand.set()
+            return
+        }
+
+        // 自动检查 buttons come before any tool: no stroke starts on a button.
+        if let hit = autoCheckButton(at: p) {
+            gesture = nil
+            onAutoCheckAction?(hit.action, hit.mark, hit.rect)
             return
         }
 
@@ -491,7 +529,7 @@ final class CanvasView: NSView {
             setNeedsDisplay(stroke.bounds.union(live.tailRect).insetBy(dx: -2, dy: -2))
             var next = board
             next.strokes.append(stroke)
-            apply(next, actionName: "书写")
+            apply(next, actionName: "书写", addedStroke: stroke.id)
 
         case .erase(let session):
             if session.changed {
@@ -682,12 +720,12 @@ final class CanvasView: NSView {
     // MARK: - Undo & canvas size
 
     /// Commits a new board as one undoable step.
-    private func apply(_ newBoard: Board, actionName: String) {
+    private func apply(_ newBoard: Board, actionName: String, addedStroke: UUID? = nil) {
         let old = board
         board = newBoard
         setNeedsDisplay(visibleRect)
         registerUndo(restoring: old, actionName: actionName)
-        contentDidChange()
+        contentDidChange(addedStroke: addedStroke)
     }
 
     private func registerUndo(restoring old: Board, actionName: String) {
@@ -703,10 +741,11 @@ final class CanvasView: NSView {
         undoManager.setActionName(actionName)
     }
 
-    private func contentDidChange() {
+    private func contentDidChange(addedStroke: UUID? = nil) {
         ensureCanvasSize()
         if Self.showsBlocks { setNeedsDisplay(visibleRect) }   // blocks can change anywhere
         onContentChange?()
+        onBoardCommit?(addedStroke)
     }
 
     /// Grows the canvas so there is always room to keep writing right and below the content.
@@ -840,6 +879,7 @@ final class CanvasView: NSView {
         }
 
         if Self.showsBlocks { drawLayoutOverlay(ctx: ctx, magnification: mag) }
+        drawAutoCheckOverlay(ctx: ctx, magnification: mag, dirtyRect: dirtyRect)
     }
 
     // MARK: - 显示分块 overlay
@@ -847,7 +887,14 @@ final class CanvasView: NSView {
     private func drawLayoutOverlay(ctx: CGContext, magnification mag: CGFloat) {
         if layoutOverlay == nil {
             let blocks = InkLayout.analyze(board).blocks
-            layoutOverlay = (blocks, PageAssembler.pages(for: blocks, options: AISettings.current.pageOptions))
+            var aiLabels: Set<String> = []
+            for (i, block) in blocks.enumerated() {
+                if Self.isAIGrouped(block, in: board) { aiLabels.insert("\(i + 1)") }
+                for (j, child) in block.children.enumerated() where Self.isAIGrouped(child, in: board) {
+                    aiLabels.insert("\(i + 1).\(j + 1)")
+                }
+            }
+            layoutOverlay = (blocks, PageAssembler.pages(for: blocks, options: AISettings.current.pageOptions), aiLabels)
         }
         guard let overlay = layoutOverlay else { return }
 
@@ -863,15 +910,26 @@ final class CanvasView: NSView {
                     color: grey, magnification: mag)
         }
         for (i, block) in overlay.blocks.enumerated() {
-            drawBlockOutline(block, label: "\(i + 1)", dashed: false, ctx: ctx, magnification: mag)
+            drawBlockOutline(block, label: "\(i + 1)", ai: overlay.aiLabels.contains("\(i + 1)"), dashed: false,
+                             ctx: ctx, magnification: mag)
             for (j, child) in block.children.enumerated() {
-                drawBlockOutline(child, label: "\(i + 1).\(j + 1)", dashed: true, ctx: ctx, magnification: mag)
+                let label = "\(i + 1).\(j + 1)"
+                drawBlockOutline(child, label: label, ai: overlay.aiLabels.contains(label), dashed: true, ctx: ctx, magnification: mag)
             }
         }
         ctx.restoreGState()
     }
 
-    private func drawBlockOutline(_ block: InkBlock, label: String, dashed: Bool, ctx: CGContext, magnification mag: CGFloat) {
+    /// A block made from an AI group (分块方式「AI 辅助」): most of its ink is in one `Board.groups` entry.
+    static func isAIGrouped(_ block: InkBlock, in board: Board) -> Bool {
+        guard InkLayout.defaultOptions.useGroups, block.imageIDs.isEmpty, !block.strokeIDs.isEmpty else { return false }
+        let ids = Set(block.strokeIDs)
+        return board.groups.contains { $0.ids.intersection(ids).count * 2 > ids.count }
+    }
+
+    /// Outline, line boxes and tag ("3 公式", "3 公式 · AI" for a block from an AI group).
+    private func drawBlockOutline(_ block: InkBlock, label: String, ai: Bool, dashed: Bool, ctx: CGContext,
+                                  magnification mag: CGFloat) {
         let color = block.kind.overlayColor
         let frame = block.bounds.insetBy(dx: -3 / mag, dy: -3 / mag)
         ctx.setFillColor(color.copy(alpha: 0.07) ?? color)
@@ -884,7 +942,7 @@ final class CanvasView: NSView {
         if dashed { ctx.setLineDash(phase: 0, lengths: [4 / mag, 3 / mag]) }
         ctx.stroke(frame)
         ctx.setLineDash(phase: 0, lengths: [])
-        drawTag("\(label) \(block.kind.title)", at: CGPoint(x: frame.minX, y: frame.minY), alignRight: false,
+        drawTag("\(label) \(block.kind.title)" + (ai ? " · AI" : ""), at: CGPoint(x: frame.minX, y: frame.minY), alignRight: false,
                 color: color, magnification: mag)
     }
 
@@ -1040,6 +1098,7 @@ final class CanvasView: NSView {
 
     private func cursor(at point: CGPoint?) -> NSCursor {
         if spaceKeyDown { return .openHand }
+        if let point, autoCheckButton(at: point) != nil { return .arrow }
         if isCapturingFormula { return .crosshair }
         switch activeTool {
         case .pen:
@@ -1093,7 +1152,7 @@ extension CanvasView: NSMenuItemValidation {
     }
 }
 
-private extension InkBlock.Kind {
+extension InkBlock.Kind {
     var title: String {
         switch self {
         case .text: return "文字"
@@ -1105,7 +1164,7 @@ private extension InkBlock.Kind {
         }
     }
 
-    var overlayColor: CGColor {
+    fileprivate var overlayColor: CGColor {
         switch self {
         case .text: return CGColor(srgbRed: 0.24, green: 0.47, blue: 0.85, alpha: 1)
         case .formula: return CGColor(srgbRed: 0.58, green: 0.32, blue: 0.85, alpha: 1)
@@ -1113,6 +1172,176 @@ private extension InkBlock.Kind {
         case .diagram: return CGColor(srgbRed: 0.18, green: 0.62, blue: 0.33, alpha: 1)
         case .image: return CGColor(srgbRed: 0.08, green: 0.58, blue: 0.68, alpha: 1)
         case .figure: return CGColor(srgbRed: 0.85, green: 0.28, blue: 0.5, alpha: 1)
+        }
+    }
+}
+
+// MARK: - 自动检查 overlay
+
+extension CanvasView {
+    /// A button below the bottom-right corner of a mark's box.
+    fileprivate struct AutoCheckButton {
+        let action: AutoCheckAction
+        let title: String
+        let rect: CGRect
+        let fontSize: CGFloat
+        let color: CGColor
+        let mark: AutoChecker.Mark
+    }
+
+    private static let checkRed = CGColor(srgbRed: 0.86, green: 0.13, blue: 0.11, alpha: 1)
+    /// Yellow leaning to orange, so it reads on white.
+    private static let checkYellow = CGColor(srgbRed: 0.93, green: 0.56, blue: 0.0, alpha: 1)
+    private static let checkGrey = CGColor(gray: 0.5, alpha: 1)
+    private static let checkBlue = CGColor(srgbRed: 0.22, green: 0.45, blue: 0.78, alpha: 1)
+
+    private static func color(of mark: AutoChecker.Mark) -> CGColor {
+        switch mark.kind {
+        case .issue(.error): return checkRed
+        case .issue(.warning): return checkYellow
+        case .modifiedBox, .recheck: return checkGrey
+        case .check: return checkBlue
+        }
+    }
+
+    /// The box drawn around a unit (and the corner the buttons hang from).
+    private func autoCheckBox(_ mark: AutoChecker.Mark, magnification mag: CGFloat) -> CGRect {
+        mark.bounds.insetBy(dx: -4 / mag, dy: -4 / mag)
+    }
+
+    /// Buttons of a mark, right-aligned under its box; constant size on screen.
+    fileprivate func autoCheckButtons(for mark: AutoChecker.Mark, magnification mag: CGFloat) -> [AutoCheckButton] {
+        let items: [(String, AutoCheckAction)]
+        var small = false
+        switch mark.kind {
+        case .issue: items = [("详情", .details), ("忽视", .dismiss), ("重新检查", .recheck)]
+        case .modifiedBox, .recheck: items = [("重新检查", .recheck)]
+        case .check: items = [("检查", .check)]; small = true
+        }
+        let fontSize = (small ? 10 : 11) / mag
+        let height = (small ? 16 : 19) / mag
+        let padX = 6 / mag, gap = 4 / mag
+        let box = autoCheckBox(mark, magnification: mag)
+        let color = Self.color(of: mark)
+        let widths = items.map { Self.buttonTitle($0.0, fontSize: fontSize, color: color).size().width + 2 * padX }
+        // Right-aligned with the box; a row wider than the box starts at its left edge instead.
+        let total = widths.reduce(0, +) + gap * CGFloat(items.count - 1)
+        var right = max(box.maxX, box.minX + total)
+        let top = box.maxY + 3 / mag
+        var buttons: [AutoCheckButton] = []
+        for ((title, action), width) in zip(items, widths).reversed() {
+            let rect = CGRect(x: right - width, y: top, width: width, height: height)
+            buttons.insert(AutoCheckButton(action: action, title: title, rect: rect, fontSize: fontSize, color: color, mark: mark), at: 0)
+            right -= width + gap
+        }
+        return buttons
+    }
+
+    private static func buttonTitle(_ title: String, fontSize: CGFloat, color: CGColor) -> NSAttributedString {
+        NSAttributedString(string: title, attributes: [
+            .font: NSFont.systemFont(ofSize: fontSize, weight: .medium),
+            .foregroundColor: NSColor(cgColor: color) ?? .labelColor,
+        ])
+    }
+
+    /// A mark's buttons as laid out at the current zoom: titles and canvas rects.
+    func autoCheckButtonFrames(for mark: AutoChecker.Mark) -> [(title: String, rect: CGRect)] {
+        autoCheckButtons(for: mark, magnification: magnification).map { ($0.title, $0.rect) }
+    }
+
+    /// The button under `point`.
+    fileprivate func autoCheckButton(at point: CGPoint) -> AutoCheckButton? {
+        let mag = magnification
+        for mark in autoCheckMarks.reversed() {
+            if let button = autoCheckButtons(for: mark, magnification: mag).first(where: { $0.rect.contains(point) }) {
+                return button
+            }
+        }
+        return nil
+    }
+
+    /// Outlines a block for a moment (picked in the 自动检查 menu); fades out after about 2 s.
+    /// Only an overlay: never touches the ink or the undo stack.
+    func flashAutoCheckBlock(_ rect: CGRect) {
+        autoCheckFlashTimer?.invalidate()
+        autoCheckFlash = (rect, 1)
+        let start = Date()
+        let hold: TimeInterval = 1.4, fade: TimeInterval = 0.6
+        let timer = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] timer in
+            guard let self else { timer.invalidate(); return }
+            let t = Date().timeIntervalSince(start)
+            guard t > hold else { return }
+            let alpha = 1 - (t - hold) / fade
+            if alpha <= 0 {
+                timer.invalidate()
+                self.autoCheckFlashTimer = nil
+                self.autoCheckFlash = nil
+            } else {
+                self.autoCheckFlash?.alpha = CGFloat(alpha)
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        autoCheckFlashTimer = timer
+    }
+
+    fileprivate func drawAutoCheckOverlay(ctx: CGContext, magnification mag: CGFloat, dirtyRect: CGRect) {
+        guard !autoCheckMarks.isEmpty || !autoCheckHighlights.isEmpty || autoCheckFlash != nil else { return }
+        ctx.saveGState()
+        // 详情 open: its block and the related ones.
+        let accent = NSColor.controlAccentColor.usingColorSpace(.sRGB)?.cgColor ?? Self.checkBlue
+        for highlight in autoCheckHighlights {
+            drawHighlight(highlight.rect, tag: highlight.tag, color: accent, ctx: ctx, magnification: mag)
+        }
+        if let flash = autoCheckFlash {
+            drawHighlight(flash.rect, tag: nil, color: accent.copy(alpha: flash.alpha) ?? accent, ctx: ctx, magnification: mag)
+        }
+
+        for mark in autoCheckMarks {
+            let box = autoCheckBox(mark, magnification: mag)
+            let color = Self.color(of: mark)
+            switch mark.kind {
+            case .issue:
+                ctx.setFillColor(color.copy(alpha: 0.05) ?? color)
+                ctx.fill(box)
+                ctx.setStrokeColor(color)
+                ctx.setLineWidth(2 / mag)
+                ctx.stroke(box)
+            case .modifiedBox:
+                ctx.setStrokeColor(color)
+                ctx.setLineWidth(1.5 / mag)
+                ctx.setLineDash(phase: 0, lengths: [5 / mag, 4 / mag])
+                ctx.stroke(box)
+                ctx.setLineDash(phase: 0, lengths: [])
+            case .recheck, .check:
+                break
+            }
+            for button in autoCheckButtons(for: mark, magnification: mag) where button.rect.intersects(dirtyRect) {
+                let path = CGPath(roundedRect: button.rect, cornerWidth: 4 / mag, cornerHeight: 4 / mag, transform: nil)
+                ctx.addPath(path)
+                ctx.setFillColor(CGColor(gray: 1, alpha: 0.97))
+                ctx.fillPath()
+                ctx.addPath(path)
+                ctx.setStrokeColor(button.color.copy(alpha: 0.85) ?? button.color)
+                ctx.setLineWidth(1 / mag)
+                ctx.strokePath()
+                let title = Self.buttonTitle(button.title, fontSize: button.fontSize, color: button.color)
+                let size = title.size()
+                title.draw(at: CGPoint(x: button.rect.midX - size.width / 2, y: button.rect.midY - size.height / 2))
+            }
+        }
+        ctx.restoreGState()
+    }
+
+    /// A tinted, outlined frame around a block, with its tag above the corner when there is one.
+    private func drawHighlight(_ rect: CGRect, tag: String?, color: CGColor, ctx: CGContext, magnification mag: CGFloat) {
+        let frame = rect.insetBy(dx: -6 / mag, dy: -6 / mag)
+        ctx.setFillColor(color.copy(alpha: 0.12 * color.alpha) ?? color)
+        ctx.fill(frame)
+        ctx.setStrokeColor(color)
+        ctx.setLineWidth(1.5 / mag)
+        ctx.stroke(frame)
+        if let tag {
+            drawTag(tag, at: CGPoint(x: frame.minX, y: frame.minY), alignRight: false, color: color, magnification: mag)
         }
     }
 }

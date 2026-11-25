@@ -137,6 +137,10 @@ public final class ACPConnection: @unchecked Sendable {
 
     /// Sends a request and waits for its result.
     public func request(_ method: String, _ params: JSONObject) async throws -> JSONObject {
+        try await request(method, params, onSent: {})
+    }
+
+    fileprivate func request(_ method: String, _ params: JSONObject, onSent: () -> Void) async throws -> JSONObject {
         try await withCheckedThrowingContinuation { continuation in
             let id: Int? = lock.sync {
                 guard failure == nil else { return nil }
@@ -150,6 +154,7 @@ public final class ACPConnection: @unchecked Sendable {
             }
             do {
                 try send(["jsonrpc": "2.0", "id": id, "method": method, "params": params])
+                onSent()
             } catch {
                 if let entry = lock.sync({ pending.removeValue(forKey: id) }) {
                     entry.continuation.resume(throwing: error)
@@ -406,17 +411,23 @@ public final class ACPAgent: @unchecked Sendable {
             guard let connection = try? await connection(),
                   let session = try? await newSession(on: connection) else { return }
             let keep = lock.sync { () -> Bool in
-                guard spare == nil else { return false }
+                guard current === connection, spare == nil else { return false }
                 spare = (connection, session.id, session.result)
                 return true
             }
-            if !keep { close(session.id, on: connection) }
+            if !keep { Self.close(session.id, on: connection) }
         }
     }
 
     /// Sends one prompt in a new session and returns the agent's reply text.
     /// `model` must be offered by the agent; an unsupported `thoughtLevel` is ignored.
     public func prompt(_ blocks: [JSONObject], model: String, thoughtLevel: String) async throws -> String {
+        let session = try await configuredSession(model: model, thoughtLevel: thoughtLevel)
+        defer { session.close() }
+        return try await session.turn(blocks)
+    }
+
+    func configuredSession(model: String, thoughtLevel: String) async throws -> ACPSession {
         try Task.checkCancellation()
         let connection = try await connection()
         let session: (id: String, result: JSONObject)
@@ -429,43 +440,24 @@ public final class ACPAgent: @unchecked Sendable {
         } else {
             session = try await newSession(on: connection)
         }
-        defer { close(session.id, on: connection) }
-
-        var options = ACPConfigOption.parse(session.result["configOptions"])
-        try await setModel(model, session: session, options: &options, on: connection)
-        try await setOption("thought_level", to: thoughtLevel, strict: false, session: session.id, options: &options, on: connection)
-
-        let collector = TextCollector()
-        connection.setUpdateHandler(for: session.id) { update in
-            guard update["sessionUpdate"] as? String == "agent_message_chunk",
-                  let content = update["content"] as? JSONObject,
-                  content["type"] as? String == "text",
-                  let text = content["text"] as? String else { return }
-            collector.append(text)
+        do {
+            var options = ACPConfigOption.parse(session.result["configOptions"])
+            try await setModel(model, session: session, options: &options, on: connection)
+            try await setOption("thought_level", to: thoughtLevel, strict: false, session: session.id,
+                                options: &options, on: connection)
+            try Task.checkCancellation()
+            return ACPSession(id: session.id, connection: connection)
+        } catch {
+            Self.close(session.id, on: connection)
+            throw error
         }
-        defer { connection.setUpdateHandler(for: session.id, nil) }
-
-        let result = try await withTaskCancellationHandler {
-            try await connection.request("session/prompt", ["sessionId": session.id, "prompt": blocks])
-        } onCancel: {
-            connection.notify("session/cancel", ["sessionId": session.id])
-        }
-        switch result["stopReason"] as? String {
-        case "cancelled": throw CancellationError()
-        case "refusal": throw ACPError.refused
-        default: break
-        }
-        try Task.checkCancellation()
-        let text = collector.text
-        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw ACPError.emptyReply }
-        return text
     }
 
     /// Lists the models and, for each, its thinking levels (both from the session config options).
     public func modelCatalog() async throws -> ACPModelCatalog {
         let connection = try await connection()
         let session = try await newSession(on: connection)
-        defer { close(session.id, on: connection) }
+        defer { Self.close(session.id, on: connection) }
 
         var catalog = ACPModelCatalog()
         let options = ACPConfigOption.parse(session.result["configOptions"])
@@ -588,11 +580,99 @@ public final class ACPAgent: @unchecked Sendable {
         if !updated.isEmpty { options = updated }
     }
 
-    private func close(_ session: String, on connection: ACPConnection) {
+    fileprivate static func close(_ session: String, on connection: ACPConnection) {
         let capabilities = connection.initializeResult["agentCapabilities"] as? JSONObject
         guard (capabilities?["sessionCapabilities"] as? JSONObject)?["close"] != nil else { return }
         Task { _ = try? await connection.request("session/close", ["sessionId": session]) }
     }
+}
+
+final class ACPSession: ModelConversation, @unchecked Sendable {
+    let id: String
+    let connection: ACPConnection
+    private let lock = NSLock()
+    private var closed = false
+
+    init(id: String, connection: ACPConnection) {
+        self.id = id
+        self.connection = connection
+    }
+
+    deinit { close() }
+
+    var isUsable: Bool { lock.sync { !closed } && connection.isAlive }
+
+    func close() {
+        let shouldClose = lock.sync {
+            defer { closed = true }
+            return !closed
+        }
+        if shouldClose, connection.isAlive { ACPAgent.close(id, on: connection) }
+    }
+
+    func send(_ parts: [PromptPart]) async throws -> String {
+        do {
+            return try await turn(parts.map(\.acpBlock))
+        } catch {
+            close()
+            throw error
+        }
+    }
+
+    func turn(_ blocks: [JSONObject]) async throws -> String {
+        guard isUsable else { throw CancellationError() }
+        try Task.checkCancellation()
+        let collector = TextCollector()
+        connection.setUpdateHandler(for: id) { update in
+            guard update["sessionUpdate"] as? String == "agent_message_chunk",
+                  let content = update["content"] as? JSONObject,
+                  content["type"] as? String == "text",
+                  let text = content["text"] as? String else { return }
+            collector.append(text)
+        }
+        defer { connection.setUpdateHandler(for: id, nil) }
+
+        let cancel = TurnCancellation(connection: connection, id: id)
+        let result = try await withTaskCancellationHandler {
+            try await connection.request("session/prompt", ["sessionId": id, "prompt": blocks], onSent: cancel.didSend)
+        } onCancel: {
+            cancel.cancel()
+        }
+        switch result["stopReason"] as? String {
+        case "cancelled": throw CancellationError()
+        case "refusal": throw ACPError.refused
+        default: break
+        }
+        try Task.checkCancellation()
+        let text = collector.text
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw ACPError.emptyReply }
+        guard isUsable else { throw CancellationError() }
+        return text
+    }
+}
+
+// Either event can arrive first. Notify only after both have happened.
+private final class TurnCancellation: @unchecked Sendable {
+    let connection: ACPConnection
+    let id: String
+    private let lock = NSLock()
+    private var sent = false
+    private var cancelled = false
+
+    init(connection: ACPConnection, id: String) {
+        self.connection = connection
+        self.id = id
+    }
+
+    func didSend() {
+        if lock.sync({ sent = true; return cancelled }) { notify() }
+    }
+
+    func cancel() {
+        if lock.sync({ cancelled = true; return sent }) { notify() }
+    }
+
+    private func notify() { connection.notify("session/cancel", ["sessionId": id]) }
 }
 
 private final class TextCollector: @unchecked Sendable {
