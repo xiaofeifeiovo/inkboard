@@ -18,6 +18,8 @@ public protocol HandwritingTranscriber: AnyObject {
     func transcribeDocument(_ pages: [InkImage]) async throws -> String
     /// Returns the types of the request's units, keyed like `Board.labels`.
     func labelBlocks(_ request: BlockLabeling.Request) async throws -> [Set<UUID>: InkBlock.Kind]
+    /// AI segmentation (分块方式「AI 辅助」): the request's units grouped into blocks, with kinds.
+    func segmentBlocks(_ request: BlockLabeling.Request) async throws -> [BlockGroup]
 }
 
 /// Model and prompt for one kind of request.
@@ -46,11 +48,16 @@ public struct AITranscriberSettings {
     public var formula: TranscriptionProfile
     /// 全局转换; 识别分块类型 uses its model and thinking level with its own fixed prompt.
     public var document: TranscriptionProfile
+    /// 自动检查: model and thinking level (its prompts are fixed, see AutoCheckPrompts).
+    public var check: TranscriptionProfile
 
-    public init(backend: AIBackendConfiguration, formula: TranscriptionProfile, document: TranscriptionProfile) {
+    /// `check` nil: 自动检查 uses the 全局转换 model and thinking level.
+    public init(backend: AIBackendConfiguration, formula: TranscriptionProfile, document: TranscriptionProfile,
+                check: TranscriptionProfile? = nil) {
         self.backend = backend
         self.formula = formula
         self.document = document
+        self.check = check ?? document
     }
 }
 
@@ -109,6 +116,13 @@ public final class AITranscriber: HandwritingTranscriber, @unchecked Sendable {
         return try BlockLabeling.parse(reply, units: request.units)
     }
 
+    public func segmentBlocks(_ request: BlockLabeling.Request) async throws -> [BlockGroup] {
+        let settings = try settings()
+        let reply = try await backend(for: settings.backend).send(
+            BlockSegmentation.parts(request), model: settings.document.model, thoughtLevel: settings.document.thoughtLevel)
+        return try BlockSegmentation.parse(reply, units: request.units)
+    }
+
     /// Models (and their thinking levels) offered by the backend in `configuration`.
     public func modelCatalog(for configuration: AIBackendConfiguration) async throws -> ACPModelCatalog {
         try await backend(for: configuration).modelCatalog()
@@ -132,6 +146,24 @@ public final class AITranscriber: HandwritingTranscriber, @unchecked Sendable {
         }
         replaced?.shutdown()
         return backend
+    }
+}
+
+// MARK: - 自动检查
+
+extension AITranscriber: AutoCheckService {
+    public func openCheckConversation() async throws -> ModelConversation {
+        let settings = try settings()
+        return try await backend(for: settings.backend).openConversation(model: settings.check.model, thoughtLevel: settings.check.thoughtLevel)
+    }
+
+    public func sendCheckRequest(_ parts: [PromptPart]) async throws -> String {
+        let settings = try settings()
+        return try await backend(for: settings.backend).send(parts, model: settings.check.model, thoughtLevel: settings.check.thoughtLevel)
+    }
+
+    public func documentPrompt() throws -> String {
+        try settings().document.prompt
     }
 }
 

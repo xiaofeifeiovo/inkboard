@@ -74,7 +74,10 @@ public final class OpenAICompatibleBackend: ModelBackend, @unchecked Sendable {
     public func shutdown() {}
 
     public func send(_ parts: [PromptPart], model: String, thoughtLevel: String) async throws -> String {
-        guard !model.isEmpty else { throw OpenAIError.missingModel }
+        try await reply(to: [Self.userMessage(parts)], model: model, thoughtLevel: thoughtLevel)
+    }
+
+    fileprivate static func userMessage(_ parts: [PromptPart]) -> JSONObject {
         let content = parts.map { part -> JSONObject in
             switch part {
             case .text(let text):
@@ -83,7 +86,12 @@ public final class OpenAICompatibleBackend: ModelBackend, @unchecked Sendable {
                 return ["type": "image_url", "image_url": ["url": "data:image/png;base64," + data.base64EncodedString()]]
             }
         }
-        var body: JSONObject = ["model": model, "messages": [["role": "user", "content": content]]]
+        return ["role": "user", "content": content]
+    }
+
+    fileprivate func reply(to messages: [JSONObject], model: String, thoughtLevel: String) async throws -> String {
+        guard !model.isEmpty else { throw OpenAIError.missingModel }
+        var body: JSONObject = ["model": model, "messages": messages]
         if !thoughtLevel.isEmpty { body["reasoning_effort"] = thoughtLevel }
 
         let json = try await call("chat/completions", body: body)
@@ -99,6 +107,11 @@ public final class OpenAICompatibleBackend: ModelBackend, @unchecked Sendable {
             ?? ""
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw OpenAIError.emptyReply }
         return text
+    }
+
+    public func openConversation(model: String, thoughtLevel: String) async throws -> ModelConversation {
+        guard !model.isEmpty else { throw OpenAIError.missingModel }
+        return ChatConversation(backend: self, model: model, thoughtLevel: thoughtLevel)
     }
 
     /// GET /models. These servers don't say which models take `reasoning_effort`, so every model
@@ -146,5 +159,44 @@ public final class OpenAICompatibleBackend: ModelBackend, @unchecked Sendable {
     private static func preview(_ json: JSONObject) -> String {
         let data = (try? JSONSerialization.data(withJSONObject: json)) ?? Data()
         return String(decoding: data.prefix(300), as: UTF8.self)
+    }
+}
+
+// History contains complete user/assistant pairs only. A failed turn closes the conversation.
+private final class ChatConversation: ModelConversation {
+    let backend: OpenAICompatibleBackend
+    let model: String
+    let thoughtLevel: String
+    private let lock = NSLock()
+    private var closed = false
+    private var history: [JSONObject] = []
+
+    init(backend: OpenAICompatibleBackend, model: String, thoughtLevel: String) {
+        self.backend = backend
+        self.model = model
+        self.thoughtLevel = thoughtLevel
+    }
+
+    var isUsable: Bool { lock.sync { !closed } }
+    func close() { lock.sync { closed = true; history.removeAll() } }
+
+    func send(_ parts: [PromptPart]) async throws -> String {
+        do {
+            try Task.checkCancellation()
+            let messages = try lock.sync {
+                guard !closed else { throw CancellationError() }
+                return history + [OpenAICompatibleBackend.userMessage(parts)]
+            }
+            let reply = try await backend.reply(to: messages, model: model, thoughtLevel: thoughtLevel)
+            try Task.checkCancellation()
+            try lock.sync {
+                guard !closed else { throw CancellationError() }
+                history = messages + [["role": "assistant", "content": reply]]
+            }
+            return reply
+        } catch {
+            lock.sync { closed = true }
+            throw error
+        }
     }
 }

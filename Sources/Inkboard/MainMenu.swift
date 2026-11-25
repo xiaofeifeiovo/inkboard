@@ -88,7 +88,12 @@ enum MainMenu {
                 .keyEquivalentModifierMask = [.command, .shift]
             menu.addItem(withTitle: "全局转换：画板 → Markdown", action: #selector(MainWindowController.convertDocument(_:)), keyEquivalent: "m")
                 .keyEquivalentModifierMask = [.command, .shift]
-            menu.addItem(withTitle: "识别分块类型（文字 / 公式 / 图）", action: #selector(MainWindowController.labelBlocks(_:)), keyEquivalent: "")
+            // 识别分块类型 (本地计算) or AI 识别分块 (AI 辅助): see LayoutSettings.
+            menu.addItem(withTitle: LayoutSettings.recognizeTitle, action: #selector(MainWindowController.recognizeBlocks(_:)), keyEquivalent: "")
+            menu.addItem(.separator())
+            menu.addItem(withTitle: "自动检查", action: #selector(MainWindowController.toggleAutoCheck(_:)), keyEquivalent: "")
+            menu.addItem(withTitle: "检查最新的块", action: #selector(MainWindowController.checkLatestBlock(_:)), keyEquivalent: "k")
+                .keyEquivalentModifierMask = [.command, .shift]
             menu.addItem(.separator())
             menu.addItem(withTitle: "AI 设置…", action: #selector(AppDelegate.showSettings(_:)), keyEquivalent: "")
         }
@@ -112,6 +117,18 @@ enum MainMenu {
         NSApp.windowsMenu = windowMenu
 
         return main
+    }
+}
+
+extension MainMenu {
+    /// Retitles 转换 → 识别分块类型 / AI 识别分块 for the current 分块方式.
+    static func updateSegmentationItem() {
+        guard let menu = NSApp?.mainMenu else { return }
+        for item in menu.items {
+            for sub in item.submenu?.items ?? [] where sub.action == #selector(MainWindowController.recognizeBlocks(_:)) {
+                sub.title = LayoutSettings.recognizeTitle
+            }
+        }
     }
 }
 

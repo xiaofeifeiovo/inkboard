@@ -2,7 +2,8 @@ import AppKit
 import InkboardCore
 
 /// 设置 (⌘,): where AI requests go — an ACP agent or an OpenAI-compatible API — and the model,
-/// thinking level and prompt used by 局部转换 and 全局转换 (识别分块类型 uses 全局转换's model).
+/// thinking level and prompt used by 局部转换 and 全局转换 (识别分块类型 uses 全局转换's model),
+/// and the model and thinking level of 自动检查 (empty: the same as 全局转换).
 /// Every edit is saved right away. Model lists come from the backend itself (the agent's session
 /// config options, or the API's /models) and are cached; a model can also be typed in.
 final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, NSTextViewDelegate {
@@ -24,7 +25,12 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
     private let formulaLevel = NSPopUpButton()
     private let documentModel = NSPopUpButton()
     private let documentLevel = NSPopUpButton()
+    private let checkModel = NSPopUpButton()
+    private let checkLevel = NSPopUpButton()
     private let maxPixelsField = NSTextField()
+    /// 分块方式 (LayoutSettings): not an AI connection setting, stored under `layout.*`.
+    let segmentationPopup = NSPopUpButton()
+    private let segmentationHint = NSTextField(wrappingLabelWithString: "")
     private var formulaPrompt: NSTextView!
     private var documentPrompt: NSTextView!
 
@@ -91,17 +97,32 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         agentStatus.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         agentStatus.preferredMaxLayoutWidth = 420
 
-        for popup in [formulaModel, formulaLevel, documentModel, documentLevel] {
+        for popup in [formulaModel, formulaLevel, documentModel, documentLevel, checkModel, checkLevel] {
             popup.target = self
             popup.action = #selector(popupChanged(_:))
         }
         formulaModel.widthAnchor.constraint(greaterThanOrEqualToConstant: 240).isActive = true
         documentModel.widthAnchor.constraint(greaterThanOrEqualToConstant: 240).isActive = true
+        checkModel.widthAnchor.constraint(greaterThanOrEqualToConstant: 240).isActive = true
 
         let formulaPromptView = makePromptEditor(height: 70)
         formulaPrompt = formulaPromptView.documentView as? NSTextView
         let documentPromptView = makePromptEditor(height: 130)
         documentPrompt = documentPromptView.documentView as? NSTextView
+
+        // Items go through the menu so the disabled one (即将支持) stays disabled.
+        segmentationPopup.autoenablesItems = false
+        for mode in SegmentationMode.allCases {
+            let item = NSMenuItem(title: LayoutSettings.title(mode), action: nil, keyEquivalent: "")
+            item.representedObject = mode.rawValue
+            item.isEnabled = LayoutSettings.isAvailable(mode)
+            segmentationPopup.menu?.addItem(item)
+        }
+        segmentationPopup.target = self
+        segmentationPopup.action = #selector(segmentationChanged(_:))
+        segmentationHint.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        segmentationHint.textColor = .secondaryLabelColor
+        segmentationHint.preferredMaxLayoutWidth = 420
 
         let reset = NSButton(title: "恢复默认设置", target: self, action: #selector(resetToDefaults(_:)))
         let empty = NSGridCell.emptyContentView
@@ -119,11 +140,17 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
             [label("模型："), formulaModel],
             [label("思考档位："), formulaLevel],
             [label("提示词："), formulaPromptView],
-            [section("全局转换：画板 → Markdown（识别分块类型也用这个模型）"), empty],
+            [section("全局转换：画板 → Markdown（识别分块类型和 AI 识别分块也用这个模型）"), empty],
             [label("模型："), documentModel],
             [label("思考档位："), documentLevel],
             [label("单张图片最长边："), row(maxPixelsField, NSTextField(labelWithString: "像素"))],
             [label("提示词："), documentPromptView],
+            [section("自动检查（提示词是固定的）"), empty],
+            [label("模型："), checkModel],
+            [label("思考档位："), checkLevel],
+            [section("分块"), empty],
+            [label("分块方式："), segmentationPopup],
+            [empty, segmentationHint],
             [empty, reset],
         ]
         let grid = NSGridView(views: rows)
@@ -217,7 +244,20 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         fillLevels(formulaLevel, model: settings.activeFormulaModel, selected: settings.activeFormulaThoughtLevel)
         fillModels(documentModel, selected: settings.activeDocumentModel)
         fillLevels(documentLevel, model: settings.activeDocumentModel, selected: settings.activeDocumentThoughtLevel)
+        fillModels(checkModel, selected: settings.activeCheckModel)
+        fillCheckLevels(selected: settings.activeCheckThoughtLevel)
+        loadSegmentationMode()
         showAgentStatus()
+    }
+
+    private func loadSegmentationMode() {
+        let mode = LayoutSettings.segmentationMode
+        if let item = segmentationPopup.itemArray.first(where: { $0.representedObject as? String == mode.rawValue }) {
+            segmentationPopup.select(item)
+        }
+        segmentationHint.stringValue = mode == .aiAssisted
+            ? "书写时仍在本机分块；可用「转换 → AI 识别分块」让 AI 纠正分组并存入文稿。打开自动检查时，若有未经 AI 分组的笔迹，会先识别一次。"
+            : "根据笔迹位置在本机分块，可在「显示 → 显示分块」中查看结果。"
     }
 
     private func showRows(for backend: AISettings.Backend) {
@@ -249,6 +289,8 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         settings.activeDocumentModel = value(of: documentModel)
         settings.activeDocumentThoughtLevel = value(of: documentLevel)
         settings.documentPrompt = documentPrompt.string
+        settings.activeCheckModel = value(of: checkModel)
+        settings.activeCheckThoughtLevel = settings.activeCheckModel.isEmpty ? "" : value(of: checkLevel)
         if let pixels = Int(maxPixelsField.stringValue.trimmingCharacters(in: .whitespaces)) {
             settings.maxImagePixels = min(max(pixels, AISettings.maxImagePixelsRange.lowerBound),
                                           AISettings.maxImagePixelsRange.upperBound)
@@ -267,7 +309,8 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         }
         // An API has no default model; an agent does.
         let isAPI = AISettings.current.backend == .openAI
-        fill(popup, defaultTitle: isAPI ? "（未选择）" : "agent 默认", values: values, selected: selected)
+        let defaultTitle = popup === checkModel ? "与全局转换相同" : isAPI ? "（未选择）" : "agent 默认"
+        fill(popup, defaultTitle: defaultTitle, values: values, selected: selected)
         popup.menu?.addItem(.separator())
         let other = NSMenuItem(title: "其他模型…", action: nil, keyEquivalent: "")
         other.representedObject = Self.otherModel
@@ -281,6 +324,21 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
             values.append(ACPConfigOption.Value(value: selected, name: selected))
         }
         fill(popup, defaultTitle: "默认", values: values, selected: selected)
+    }
+
+    /// 自动检查 without a model of its own uses 全局转换's thinking level too.
+    private func fillCheckLevels(selected: String) {
+        let model = value(of: checkModel)
+        if model.isEmpty {
+            fill(checkLevel, defaultTitle: "与全局转换相同", values: [], selected: "")
+        } else {
+            fillLevels(checkLevel, model: model, selected: selected)
+        }
+        checkLevel.isEnabled = !model.isEmpty
+    }
+
+    private func levels(for modelPopup: NSPopUpButton) -> NSPopUpButton {
+        modelPopup === formulaModel ? formulaLevel : modelPopup === documentModel ? documentLevel : checkLevel
     }
 
     private func fill(_ popup: NSPopUpButton, defaultTitle: String, values: [ACPConfigOption.Value], selected: String) {
@@ -324,6 +382,13 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
 
     // MARK: - Actions
 
+    @objc private func segmentationChanged(_ sender: NSPopUpButton) {
+        if let raw = sender.selectedItem?.representedObject as? String, let mode = SegmentationMode(rawValue: raw) {
+            LayoutSettings.segmentationMode = mode
+        }
+        loadSegmentationMode()
+    }
+
     @objc private func backendChanged(_ sender: Any?) {
         save()
         load()
@@ -336,14 +401,18 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
             return
         }
         // A new model may not offer the chosen thinking level; fall back to its default.
-        if sender === formulaModel || sender === documentModel {
-            let levels = sender === formulaModel ? formulaLevel : documentLevel
+        if sender === formulaModel || sender === documentModel || sender === checkModel {
+            let levels = levels(for: sender)
             let model = value(of: sender)
             let key = model.isEmpty ? catalog?.defaultModel ?? "" : model
             let current = value(of: levels)
             let offered = catalog?.thoughtLevels[key]?.contains { $0.value == current } ?? true
             isLoading = true
-            fillLevels(levels, model: model, selected: offered ? current : "")
+            if sender === checkModel {
+                fillCheckLevels(selected: offered ? current : "")
+            } else {
+                fillLevels(levels, model: model, selected: offered ? current : "")
+            }
             isLoading = false
         }
         save()
@@ -352,7 +421,8 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
     /// 「其他模型…」: a model the list doesn't offer (or no list could be read).
     private func askForModelName(for popup: NSPopUpButton) {
         let settings = AISettings.current
-        let current = popup === formulaModel ? settings.activeFormulaModel : settings.activeDocumentModel
+        let current = popup === formulaModel ? settings.activeFormulaModel
+            : popup === documentModel ? settings.activeDocumentModel : settings.activeCheckModel
         isLoading = true
         fillModels(popup, selected: current)   // undo the selection of 「其他模型…」 for now
         isLoading = false
@@ -371,8 +441,11 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
             let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
             self.isLoading = true
             self.fillModels(popup, selected: name)
-            let levels = popup === self.formulaModel ? self.formulaLevel : self.documentLevel
-            self.fillLevels(levels, model: name, selected: "")
+            if popup === self.checkModel {
+                self.fillCheckLevels(selected: "")
+            } else {
+                self.fillLevels(self.levels(for: popup), model: name, selected: "")
+            }
             self.isLoading = false
             self.save()
         }
@@ -426,6 +499,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
     @objc private func resetToDefaults(_ sender: Any?) {
         let before = AISettings.current.catalogSource
         AISettings.reset()
+        LayoutSettings.segmentationMode = .geometric
         load()
         if AISettings.current.catalogSource != before || catalog == nil { refreshModels(nil) }
     }

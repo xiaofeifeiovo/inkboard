@@ -11,6 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillFinishLaunching(_ notification: Notification) {
         // Set before launch finishes so NSDocumentController finds the Open Recent menu.
         NSApp.mainMenu = MainMenu.build()
+        LayoutSettings.apply()   // 分块方式 → InkLayout.defaultOptions, before any document opens
         // Deliver every tablet sample instead of merging them; keeps fast strokes smooth.
         NSEvent.isMouseCoalescingEnabled = false
     }

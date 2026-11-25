@@ -611,6 +611,15 @@ if FileManager.default.isExecutableFile(atPath: python) {
     print("  - skipped: \(python) not found")
 }
 
+print("分块：数学版式、AI 分组、真实样本 test/test.inkboard")
+await runLayoutChecks()
+
+print("自动检查：核心逻辑")
+await runAutoCheckCoreChecks()
+
+print("自动检查：调度")
+await runAutoCheckerChecks()
+
 // Sample render for eyeballing stroke quality.
 let outputPath = CommandLine.arguments.dropFirst().first ?? "inkboard-sample.png"
 do {

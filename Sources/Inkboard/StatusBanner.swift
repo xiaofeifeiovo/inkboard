@@ -1,10 +1,10 @@
 import AppKit
 
 /// A small floating status pill shown over the top of the canvas: a hint, a spinner while an AI
-/// request runs, or the result, with an optional button (取消, 在 Finder 中显示, …).
+/// request runs, the result or an error, with an optional button (取消, 在 Finder 中显示, 重试, …).
 final class StatusBanner: NSVisualEffectView {
     enum Style {
-        case info, progress, success
+        case info, progress, success, error
     }
 
     private let spinner = NSProgressIndicator()
@@ -77,6 +77,9 @@ final class StatusBanner: NSVisualEffectView {
         case .success:
             icon.image = NSImage(systemSymbolName: "checkmark.circle.fill", accessibilityDescription: nil)
             icon.contentTintColor = .systemGreen
+        case .error:
+            icon.image = NSImage(systemSymbolName: "exclamationmark.triangle.fill", accessibilityDescription: nil)
+            icon.contentTintColor = .systemOrange
         case .progress:
             icon.image = nil
         }

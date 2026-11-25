@@ -16,17 +16,26 @@ public protocol ModelBackend: AnyObject {
     func send(_ parts: [PromptPart], model: String, thoughtLevel: String) async throws -> String
     /// The models (and thinking levels) to offer in 设置.
     func modelCatalog() async throws -> ACPModelCatalog
+    /// A multi-turn conversation (自动检查). Same `model` / `thoughtLevel` rules as `send`.
+    func openConversation(model: String, thoughtLevel: String) async throws -> ModelConversation
     func shutdown()
 }
 
 extension ACPAgent: ModelBackend {
     public func send(_ parts: [PromptPart], model: String, thoughtLevel: String) async throws -> String {
-        let blocks = parts.map { part -> JSONObject in
-            switch part {
-            case .text(let text): return ACPContent.text(text)
-            case .png(let data): return ACPContent.image(png: data)
-            }
+        return try await prompt(parts.map(\.acpBlock), model: model, thoughtLevel: thoughtLevel)
+    }
+
+    public func openConversation(model: String, thoughtLevel: String) async throws -> ModelConversation {
+        try await configuredSession(model: model, thoughtLevel: thoughtLevel)
+    }
+}
+
+extension PromptPart {
+    var acpBlock: JSONObject {
+        switch self {
+        case .text(let text): return ACPContent.text(text)
+        case .png(let data): return ACPContent.image(png: data)
         }
-        return try await prompt(blocks, model: model, thoughtLevel: thoughtLevel)
     }
 }

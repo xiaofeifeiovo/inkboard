@@ -13,6 +13,12 @@ final class BoardDocument: NSDocument {
     static let typeIdentifier = "local.inkboard.board"
 
     private(set) var board = Board()
+    /// 自动检查 results, fixed pages and the switch. Not part of `board`: results arrive
+    /// asynchronously and stay out of undo; changes mark the document edited directly.
+    private(set) var autoCheck = AutoCheckState()
+
+    /// Where 自动检查 requests go (replaceable for testing the UI without real requests).
+    static var makeCheckService: () -> AutoCheckService = { AppDelegate.transcriber }
 
     private var boardWindowController: MainWindowController? {
         windowControllers.first as? MainWindowController
@@ -29,19 +35,24 @@ final class BoardDocument: NSDocument {
     }
 
     override func makeWindowControllers() {
-        let controller = MainWindowController(transcriber: AppDelegate.transcriber)
+        let controller = MainWindowController(transcriber: AppDelegate.transcriber, checkService: Self.makeCheckService())
         addWindowController(controller)
-        controller.canvas.load(board)
+        controller.load(board, autoCheck: autoCheck)
         controller.canvas.onContentChange = { [weak self, weak controller] in
             guard let self, let canvas = controller?.canvas else { return }
             self.board = canvas.board
+        }
+        controller.onAutoCheckStateChange = { [weak self] state in
+            guard let self, state != self.autoCheck else { return }
+            self.autoCheck = state
+            self.updateChangeCount(.changeDone)   // not undoable, so no undo registration marks it
         }
     }
 
     // MARK: - Reading & writing
 
     override func data(ofType typeName: String) throws -> Data {
-        try BoardStore.encode(board)
+        try BoardStore.encode(board, autoCheck: autoCheck)
     }
 
     override func read(from data: Data, ofType typeName: String) throws {
@@ -55,7 +66,8 @@ final class BoardDocument: NSDocument {
             ])
         }
         board = loaded
+        autoCheck = BoardStore.decodeAutoCheck(data, board: loaded)
         // Revert / restoring an older version re-reads an already open document.
-        boardWindowController?.canvas.load(loaded)
+        boardWindowController?.load(loaded, autoCheck: autoCheck)
     }
 }

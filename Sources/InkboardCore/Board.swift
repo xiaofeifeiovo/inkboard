@@ -14,11 +14,17 @@ public struct Board {
     /// of stroke ids — by the AI (see `BlockLabeling`) or by hand. `InkLayout` uses them instead
     /// of its own guesses; a key that no longer matches a unit (the ink changed) is ignored.
     public var labels: [Set<UUID>: InkBlock.Kind]
+    /// Blocks found by the AI (分块方式「AI 辅助」, see `BlockSegmentation`): each group's strokes
+    /// form one block of its kind. `InkLayout` follows them when `Options.useGroups` is on; ink
+    /// written later is segmented by geometry (and joins the group it is attached to).
+    public var groups: [BlockGroup]
 
-    public init(strokes: [Stroke] = [], images: [BoardImage] = [], labels: [Set<UUID>: InkBlock.Kind] = [:]) {
+    public init(strokes: [Stroke] = [], images: [BoardImage] = [], labels: [Set<UUID>: InkBlock.Kind] = [:],
+                groups: [BlockGroup] = []) {
         self.strokes = strokes
         self.images = images
         self.labels = labels
+        self.groups = groups
     }
 
     public var isEmpty: Bool { strokes.isEmpty && images.isEmpty }
@@ -40,12 +46,31 @@ public struct Board {
     /// Only the items in `ids`, in their original order.
     public func subset(_ ids: Set<UUID>) -> Board {
         Board(strokes: strokes.filter { ids.contains($0.id) }, images: images.filter { ids.contains($0.id) },
-              labels: labels.filter { $0.key.isSubset(of: ids) })
+              labels: labels.filter { $0.key.isSubset(of: ids) },
+              groups: groups.compactMap { $0.restricted(to: ids) })
     }
 
     public func removing(_ ids: Set<UUID>) -> Board {
         Board(strokes: strokes.filter { !ids.contains($0.id) }, images: images.filter { !ids.contains($0.id) },
-              labels: labels.filter { $0.key.isDisjoint(with: ids) })
+              labels: labels.filter { $0.key.isDisjoint(with: ids) },
+              groups: groups.compactMap { $0.restricted(to: $0.ids.subtracting(ids)) })
+    }
+}
+
+/// One block as the AI grouped it: these strokes belong together, as this kind.
+public struct BlockGroup: Equatable {
+    public var ids: Set<UUID>
+    public var kind: InkBlock.Kind
+
+    public init(ids: Set<UUID>, kind: InkBlock.Kind) {
+        self.ids = ids
+        self.kind = kind
+    }
+
+    /// The group limited to `ids`; nil when nothing is left.
+    public func restricted(to ids: Set<UUID>) -> BlockGroup? {
+        let kept = self.ids.intersection(ids)
+        return kept.isEmpty ? nil : BlockGroup(ids: kept, kind: kind)
     }
 }
 

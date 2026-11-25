@@ -4,10 +4,13 @@
 #   scripts/build.sh            release build
 #   scripts/build.sh debug      debug build
 #   scripts/build.sh check      build, then run the core self-check
+#
+# INKBOARD_BUILD_DIR=/some/dir builds there instead of build/ (and skips registering the app with
+# Launch Services), so several builds can run side by side.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BUILD="$ROOT/build"
+BUILD="${INKBOARD_BUILD_DIR:-$ROOT/build}"
 OBJ="$BUILD/obj"
 MODE="${1:-release}"
 
@@ -39,7 +42,7 @@ cp "$ROOT/Support/Info.plist" "$APP/Contents/Info.plist"
 codesign --force --sign - "$APP" >/dev/null 2>&1 || echo "  (ad-hoc codesign skipped)"
 # Register with Launch Services so Finder knows .inkboard files open with this app.
 LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
-[ -x "$LSREGISTER" ] && "$LSREGISTER" -f "$APP" >/dev/null 2>&1 || true
+[ -z "${INKBOARD_BUILD_DIR:-}" ] && [ -x "$LSREGISTER" ] && "$LSREGISTER" -f "$APP" >/dev/null 2>&1 || true
 echo "✓ $APP"
 
 if [ "$MODE" = "check" ]; then
