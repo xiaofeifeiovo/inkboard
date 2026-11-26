@@ -17,6 +17,27 @@ func runLayoutChecks() async {
         } catch { check(false, "Integral sample failed to load: \(error)") }
     } else { print("  - skipped: \(sample.path) not found") }
 
+    // Statistics notes: one statement per row, rows well apart, text and formulas mixed in a row.
+    let notes = sample.deletingLastPathComponent().appendingPathComponent("多元统计分析.inkboard")
+    if FileManager.default.fileExists(atPath: notes.path) {
+        do {
+            let board = try BoardStore.decode(Data(contentsOf: notes))
+            let blocks = InkLayout.analyze(board, options: .init()).blocks
+            let indices = Dictionary(uniqueKeysWithValues: board.strokes.enumerated().map { ($1.id, $0 + 1) })
+            let ranges = blocks.map { $0.strokeIDs.compactMap { indices[$0] } }
+            let rows: [[Int]] = [Array(1...46), Array(47...79), Array(80...130), Array(131...190), Array(191...242) + [289],
+                                 Array(243...288), Array(290...365) + Array(432...434), Array(366...379), Array(380...431),
+                                 Array(435...477)]
+            check(blocks.map(\.kind) == [.text, .text, .formula, .formula, .formula, .text, .text, .text, .formula, .formula]
+                  && blocks.allSatisfy { $0.lines.count == 1 } && ranges == rows,
+                  "Statistics notes: one block per written row (\(describe(blocks)))")
+            // Row 3: hooked bar, superscript of t² left of the "="; row 5: hooked bar;
+            // row 10: numerator overhanging the bar's end.
+            check([2, 4, 8, 9].allSatisfy { blocks.indices.contains($0) && blocks[$0].lines.first?.hasFraction == true },
+                  "…every fraction keeps its denominator")
+        } catch { check(false, "Statistics notes failed to load: \(error)") }
+    } else { print("  - skipped: \(notes.path) not found") }
+
     let options = InkLayout.Options(textHeight: 16)
     func blocks(_ ink: [Stroke]) -> [InkBlock] { InkLayout.analyze(Board(strokes: ink), options: options).blocks }
     let word = textLine(x: 20, baseline: 46, words: [3])
@@ -37,6 +58,16 @@ func runLayoutChecks() async {
     check(boxed.map(\.kind) == [.text] && boxed[0].strokeIDs.count == 4 && boxed[0].lines.count == 1, "Closed frame keeps its word")
     let separated = blocks(word + textLine(x: 20, baseline: 89, words: [3]))
     check(separated.map(\.lines.count) == [1, 1], "A gap larger than 1.5 text heights separates paragraphs")
+    let hooked = penStroke(line(from: CGPoint(x: 60, y: 60), to: CGPoint(x: 110, y: 60.5), samples: 6) + [(107, 63, 0.6)])
+    let fraction = blocks(textLine(x: 66, baseline: 55, words: [3]) + [hooked] + textLine(x: 66, baseline: 79, words: [3]))
+    check(fraction.map(\.kind) == [.formula] && fraction[0].lines.count == 1 && fraction[0].lines[0].hasFraction,
+          "A fraction bar hooked at its end is still a bar (\(describe(fraction)))")
+    let row = blocks(word + textLine(x: 120, baseline: 46, words: [3]))
+    check(row.count == 1 && row[0].lines.count == 1, "Writing four text heights further right stays on its row")
+    let outdented = blocks(textLine(x: 60, baseline: 40, words: [3, 2]) + textLine(x: 20, baseline: 76, words: [4, 3]))
+    let aligned = blocks(textLine(x: 20, baseline: 40, words: [3, 2]) + textLine(x: 20, baseline: 76, words: [4, 3]))
+    check(outdented.map(\.lines.count) == [1, 1] && aligned.map(\.lines.count) == [2],
+          "A moderate gap separates rows starting at different margins, not rows sharing one")
 
     let second = textLine(x: 20, baseline: 136, words: [3])
     var board = Board(strokes: word + second)

@@ -48,6 +48,8 @@ public final class AutoChecker {
         case transcribingPage
         /// Re-judging later blocks from their transcriptions (text only).
         case laterBlocks([String])
+        /// Re-judging the current page from its first edited block on, in a new conversation.
+        case recheck([String])
         /// Opening a conversation.
         case starting
     }
@@ -73,6 +75,10 @@ public final class AutoChecker {
     /// `marks`, `activity` or what the menu lists changed.
     public var onDisplayChange: (() -> Void)?
 
+    /// 自动重新检查: a block edited since its check is re-checked by itself once the edit is finished
+    /// (writing goes on in another block), like 重新检查. Off: edited blocks wait for 重新检查.
+    public var autoRecheck = false
+
     /// How open pages are packed (the app passes `AISettings.pageOptions`, like 全局转换).
     public var pageOptions: PageAssembler.Options {
         didSet { refreshMarks() }
@@ -93,6 +99,8 @@ public final class AutoChecker {
         var automatic: Bool
         /// After it is sent, writing on in the same block re-checks it automatically ("接着写").
         var continuable: Bool
+        /// 自动重新检查 of a finished edit: handled like 重新检查 (context rebuilt), fixed pages included.
+        var recheck = false
     }
 
     /// The conversation of the current (first open) page.
@@ -124,6 +132,9 @@ public final class AutoChecker {
     /// Tags given to units that have no check yet (sent on a page image, or awaiting an answer),
     /// so a unit keeps its tag until it has a result.
     private var provisionalTags: [String: Set<UUID>] = [:]
+    /// Strokes of blocks changed by edits other than writing (erasing, undo, moving) whose edit is
+    /// not finished yet: it is once writing goes on in another block.
+    private var editedIDs: Set<UUID> = []
 
     public init(service: AutoCheckService, state: AutoCheckState = AutoCheckState(),
                 pageOptions: PageAssembler.Options = PageAssembler.Options()) {
@@ -140,6 +151,7 @@ public final class AutoChecker {
         self.state = state
         provisionalTags = [:]
         continuationTag = nil
+        editedIDs = []
         tracker.reset()
         setBoard(board)
         displayChanged()
@@ -156,12 +168,32 @@ public final class AutoChecker {
             layoutDidChange(board)
             return
         }
+        let previous = Set(units.map(\.ids))
         setBoard(board)
         if state.enabled, let stroke = addedStroke {
             // Usually one finished block; after a split, every part left behind.
             tracker.didWriteUnits(stroke, units: units).forEach(blockFinished)
+            editsFinished(writing: stroke)
+        } else if state.enabled {
+            // Erasing, undo, moving: blocks that changed and are no longer as checked.
+            for unit in units where !previous.contains(unit.ids) {
+                if case .modified = status(of: unit) { editedIDs.formUnion(unit.ids) }
+            }
         }
         displayChanged()
+    }
+
+    /// Writing went on (`writing` is the new stroke): edits in other blocks are finished. With
+    /// 自动重新检查 on they are re-checked; the block being written is finished by the tracker.
+    private func editsFinished(writing stroke: UUID) {
+        guard !editedIDs.isEmpty else { return }
+        let writing = units.first { $0.ids.contains(stroke) }
+        let finished = units.filter { $0.ids != writing?.ids && !$0.ids.isDisjoint(with: editedIDs) }
+        editedIDs = []
+        guard autoRecheck else { return }
+        for unit in finished {
+            if case .modified = status(of: unit) { enqueue(Job(kind: .unit(unit.ids), automatic: true, continuable: false, recheck: true)) }
+        }
     }
 
     /// The segmentation changed while the ink did not: new AI groups (AI 识别分块, its undo / redo)
@@ -202,6 +234,7 @@ public final class AutoChecker {
         guard on != state.enabled else { return }
         cancelAll()
         tracker.reset()
+        editedIDs = []
         state.enabled = on
         stateChanged()
         if on { enqueue(Job(kind: .fullCheck, automatic: true, continuable: false)) }
@@ -408,8 +441,13 @@ public final class AutoChecker {
         case .checked:
             break
         case .modified:
-            // Writing on in the block checked last re-checks it; other edits wait for 重新检查.
-            if continues(unit) { enqueue(Job(kind: .unit(unit.ids), automatic: true, continuable: true)) }
+            // Writing on in the block checked last re-checks it; other edits wait for 重新检查
+            // (or are re-checked right away with 自动重新检查).
+            if continues(unit) {
+                enqueue(Job(kind: .unit(unit.ids), automatic: true, continuable: true))
+            } else if autoRecheck {
+                enqueue(Job(kind: .unit(unit.ids), automatic: true, continuable: false, recheck: true))
+            }
         }
     }
 
@@ -428,6 +466,7 @@ public final class AutoChecker {
             queue[i].kind = .unit(ids)
             queue[i].automatic = queue[i].automatic && job.automatic
             queue[i].continuable = queue[i].continuable || job.continuable
+            queue[i].recheck = queue[i].recheck || job.recheck
         } else if job.kind == .fullCheck, queue.contains(where: { $0.kind == .fullCheck }) {
             return
         } else {
@@ -557,7 +596,7 @@ public final class AutoChecker {
             guard let unit = resolve(ids) else { return }   // erased meanwhile
             if job.automatic, case .checked = status(of: unit) { return }   // checked meanwhile (switching on)
             if let index = fixedPageIndex(of: unit) {
-                if job.automatic { return }
+                if job.automatic && !job.recheck { return }
                 try await recheckFixedPage(index, target: unit, run: run)
                 return
             }
@@ -574,6 +613,12 @@ public final class AutoChecker {
                     try await fixPage(pages[0], run: run)
                     continue
                 }
+            }
+            // 重新检查 (or 自动重新检查) of a block that has a check, other than writing on in the
+            // block sent last: the page from its first edited block on, in a new conversation.
+            if job.recheck || (!job.automatic && !isNew(unit) && !continues(unit)) {
+                try await recheckPage(unit.ids, continuable: job.continuable, run: run)
+                return
             }
             if conversation == nil || conversation?.conversation.isUsable == false || conversationStale
                 || conversationLostContext() {
@@ -600,6 +645,94 @@ public final class AutoChecker {
         }
     }
 
+    private func isChecked(_ unit: CheckUnit) -> Bool {
+        if case .checked = status(of: unit) { return true }
+        return false
+    }
+
+    private func isNew(_ unit: CheckUnit) -> Bool {
+        status(of: unit) == .unchecked
+    }
+
+    /// Blocks of the page shown as context when a conversation starts, in reading order: a checked
+    /// block with its verdict; one edited since its check as it is now, without one (it waits for
+    /// 重新检查). Blocks never checked and the block being written are left out. `checked`: tags
+    /// with verdicts.
+    private func contextParts(_ others: [CheckUnit]) -> (parts: [PromptPart], checked: [String]) {
+        let writing = tracker.currentUnit(in: units)
+        let nextTag = state.nextTag
+        var parts: [PromptPart] = []
+        var checked: [String] = []
+        for other in others {
+            if case .checked(let tag) = status(of: other), let check = state.check(tagged: tag) {
+                guard let image = AutoCheckRender.blockImage(other, board: board) else { continue }
+                parts += [.text(AutoCheckPrompts.blockLabel(tag)), .png(image.pngData),
+                          .text(AutoCheckPrompts.previousVerdict(Self.verdictJSON(check)))]
+                checked.append(tag)
+            } else if case .modified = status(of: other), other.ids != writing?.ids,
+                      let image = AutoCheckRender.blockImage(other, board: board) {
+                parts += [.text(AutoCheckPrompts.blockLabel(tag(for: other))), .png(image.pngData),
+                          .text(AutoCheckPrompts.noVerdictNote)]
+            }
+        }
+        if !parts.isEmpty { parts.insert(.text(AutoCheckPrompts.checkedBlocksHeading), at: 0) }
+        if state.nextTag != nextTag { stateChanged() }   // a tag handed out to a split-off edited part
+        return (parts, checked)
+    }
+
+    /// 重新检查 (or 自动重新检查) on an open page (docs/auto-check.md §4.4): a new conversation, whose
+    /// context is the page up to its first block without a valid verdict (checked blocks, with their
+    /// verdicts); from there to the end of the page every block is judged again in one turn. The
+    /// block being written is left out (it is checked when finished) unless it is the one asked about.
+    private func recheckPage(_ ids: Set<UUID>, continuable: Bool, run: Int) async throws {
+        closeConversation()
+        setStage(.starting, busy: ids)
+        let opened = try await service.openCheckConversation()
+        guard run == self.run else { opened.close(); throw CancellationError() }
+        var conv = PageConversation(conversation: opened)
+        conversation = conv
+        // The board may have changed while the conversation opened.
+        guard let target = resolve(ids), fixedPageIndex(of: target) == nil,
+              let page = openPages().first(where: { !$0.ids.isDisjoint(with: target.ids) }) else { return }
+        let writing = tracker.currentUnit(in: units)
+        let pageUnits = units(on: page).filter { $0.ids == target.ids || $0.ids != writing?.ids }
+        guard let start = pageUnits.firstIndex(where: { $0.ids == target.ids || !isChecked($0) }) else { return }
+        let judge = Array(pageUnits[start...])
+        let unchanged = judge.map { $0.ids != target.ids && isChecked($0) }
+        let tags = judge.map { tag(for: $0) }
+        let changed = zip(judge, tags).filter { !isChecked($0.0) }.map(\.1)
+        stateChanged()   // tags handed out
+
+        var parts: [PromptPart] = [.text(AutoCheckPrompts.conversationIntro)]
+        parts += previousPagesParts(state.pages)
+        let context = contextParts(Array(pageUnits[..<start]))
+        parts += context.parts
+        parts.append(.text(AutoCheckPrompts.recheckFrom(tags, changed: changed)))
+        for (unit, tag) in zip(judge, tags) {
+            guard let image = AutoCheckRender.blockImage(unit, board: board) else { continue }
+            parts += [.text(AutoCheckPrompts.blockLabel(tag)), .png(image.pngData)]
+        }
+        if continuable, let i = judge.firstIndex(where: { $0.ids == target.ids }) { continuationTag = tags[i] }
+        setStage(.recheck(tags), busy: judge.reduce(into: Set<UUID>()) { $0.formUnion($1.ids) })
+        let reply = try await conv.conversation.send(parts)
+        try ensureCurrent(run)
+
+        let results = try AutoCheckReply.parseChecks(reply, expected: Set(tags))
+        guard Set(tags).isSubset(of: results.map(\.tag)) else { throw AutoCheckError.unreadableReply(reply) }
+        for (k, unit) in judge.enumerated() {
+            guard let result = results.first(where: { $0.tag == tags[k] }) else { continue }
+            if unchanged[k] {
+                updateVerdict(result, keepReading: false)   // same ink: 忽视 stays if the issues are the same
+            } else {
+                setVerdict(result, ids: unit.ids)
+            }
+        }
+        conv.sent = context.checked + tags
+        conv.turns = 1
+        if conversation?.conversation === conv.conversation { conversation = conv }
+        stateChanged()
+    }
+
     /// One turn of the page conversation about `unit` (docs/auto-check.md §4).
     private func sendBlock(_ unit: CheckUnit, page: InkPage, continuable: Bool, run: Int) async throws {
         guard var conv = conversation else { return }
@@ -610,22 +743,13 @@ public final class AutoChecker {
         var later: [String] = []
 
         if conv.turns == 0 {
-            // Context: the fixed pages' Markdown and this page's checked blocks with their verdicts.
+            // Context (docs/auto-check.md §4.5): the fixed pages' Markdown and this page's other
+            // blocks, checked ones with their verdicts, edited ones as they are now.
             parts.append(.text(AutoCheckPrompts.conversationIntro))
             parts += previousPagesParts(state.pages)
-            var included: [String] = []
-            var checkedParts: [PromptPart] = []
-            for other in units(on: page) where other.ids != unit.ids {
-                guard case .checked(let otherTag) = status(of: other), let check = state.check(tagged: otherTag),
-                      let otherImage = AutoCheckRender.blockImage(other, board: board) else { continue }
-                checkedParts += [.text(AutoCheckPrompts.blockLabel(otherTag)), .png(otherImage.pngData),
-                                 .text(AutoCheckPrompts.previousVerdict(Self.verdictJSON(check)))]
-                included.append(otherTag)
-            }
-            if !checkedParts.isEmpty {
-                parts.append(.text(AutoCheckPrompts.checkedBlocksHeading))
-                parts += checkedParts
-            }
+            let context = contextParts(units(on: page).filter { $0.ids != unit.ids })
+            parts += context.parts
+            let included = context.checked
             conv.sent = included
             if hadCheck {
                 // Blocks after it in reading order may depend on it.

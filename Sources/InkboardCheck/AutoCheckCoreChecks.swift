@@ -197,7 +197,7 @@ private func replayHandwriting() throws {
     check(missingCurrent.isEmpty, "sample strokes missing from the current unit: \(missingCurrent)")
     print("  Replay (\(source.strokes.count) strokes): " + events.joined(separator: ", "))
     check(events == [
-        "11: formula[1–10] new B1", "28: formula[1–26] recheck B1", "38: formula[1–37] recheck B1",
+        "11: formula[1–10] new B1", "38: formula[1–37] recheck B1",
         "61: formula[1–60] recheck B1",
         "101: text[61–100] new B2", "120: formula[101–119] new B3"
     ], "real note extends the derivation in B1 and finishes each following line when writing moves on")

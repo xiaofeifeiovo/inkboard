@@ -74,13 +74,17 @@ public struct InkLine: Equatable {
 /// (the typical height of a written word, estimated from the ink), so handwriting size and zoom
 /// don't matter. Steps:
 ///
-///  1. Each stroke is text, a rule (a straight horizontal line) or a graphic (much larger than writing).
-///  2. A rule with ink right above and right below it, neither reaching past its ends, is a fraction
-///     bar: bar, numerator and denominator are glued together. With ink only above, it's an underline.
+///  1. Each stroke is text, a rule (a straight or flat horizontal line, maybe hooked at an end) or a
+///     graphic (much larger than writing).
+///  2. A rule with ink right above and right below it, neither reaching past its ends (a little
+///     overhang is fine; ink beyond an "=" or letter on the bar's level is the rest of the formula),
+///     is a fraction bar: bar, numerator and denominator are glued together. With ink only above,
+///     it's an underline.
 ///     A rule on its own that is long or touches a drawing belongs to drawings. Two short parallel
 ///     bars written one after the other, with no other ink around them, are an "=".
 ///  3. Text strokes become glyphs (written one after the other and close together; dots join their
-///     neighbour), and glyphs become lines (overlapping vertically, with word-sized gaps at most).
+///     neighbour), and glyphs become lines (overlapping vertically, up to 5h apart), unless a drawing
+///     or a column gutter (the same blank strip in a nearby row) lies between them.
 ///     A small fragment right next to a line (a superscript, a low subscript) joins it.
 ///     Each line is text or a formula: its label in `Board.labels`, else a guess (fraction or "=").
 ///  4. Graphic strokes close to each other form drawings. A drawing takes the lines lying inside it
@@ -88,7 +92,8 @@ public struct InkLine: Equatable {
 ///  5. A pasted picture takes the lines lying mostly on it and the drawings reaching onto it
 ///     (pictures sharing ink, or overlapping, become one figure). Inside, the same rules apply.
 ///  6. The remaining lines become paragraphs (lines close below one another that overlap
-///     horizontally), split where lines change between text and formula.
+///     horizontally; a moderate gap only between lines starting at the same left margin), split
+///     where lines change between text and formula.
 ///  7. Reading order: recursive XY-cut, top to bottom first, then left to right. A caption (a short
 ///     text block right under a drawing or picture) stays right after it.
 ///
@@ -248,7 +253,15 @@ private final class Analyzer {
             let first = points[0].location, last = points[points.count - 1].location
             let chord = hypot(last.x - first.x, last.y - first.y)
             let isStraight = total >= h && chord >= 0.93 * total
-            let isHorizontal = isStraight && abs(last.y - first.y) <= 0.27 * abs(last.x - first.x)
+            var spanX = (min: first.x, max: first.x), spanY = (min: first.y, max: first.y)
+            for p in points {
+                spanX = (min(spanX.min, p.x), max(spanX.max, p.x))
+                spanY = (min(spanY.min, p.y), max(spanY.max, p.y))
+            }
+            let width = spanX.max - spanX.min, height = spanY.max - spanY.min
+            // Long and flat is a rule even when the pen hooks at an end (common for fraction bars).
+            let isFlat = total >= h && width >= 0.9 * total && height <= 0.2 * width
+            let isHorizontal = (isStraight && abs(last.y - first.y) <= 0.27 * abs(last.x - first.x)) || isFlat
             let b = stroke.bounds
 
             let role: Role
@@ -342,20 +355,32 @@ private final class Analyzer {
         var graphicGrid = RectGrid(cell: 4 * h)
         for i in graphic { graphicGrid.insert(i, bounds[i]) }
 
-        let reach = 0.8 * h, margin = 1.0 * h
+        let reach = 0.8 * h, margin = 1.0 * h, overhang = 0.3 * h
         for r in (0..<n).filter({ role[$0] == .rule && !isEquals[$0] }).sorted(by: { length[$0] > length[$1] }) {
             let bar = bounds[r]
             var above: [Int] = [], below: [Int] = []
             var aboveSpills = false, belowSpills = false
-            for s in grid.query(bar.insetBy(dx: -margin, dy: -reach)) where s != r {
+            let nearby = grid.query(bar.insetBy(dx: -margin, dy: -reach)).filter { $0 != r }
+            /// Ink on the bar's level between `s` and the bar ("=", "+", a letter like t): `s` is part of
+            /// the expression around a fraction (t² = …), not a line of text running past an underline.
+            func beyondExpression(_ s: Int) -> Bool {
+                let mid = bounds[s].midX
+                let (lo, hi) = mid < bar.midX ? (mid, bar.minX) : (bar.maxX, mid)
+                return nearby.contains { k in
+                    k != s && bounds[k].midX > lo && bounds[k].midX < hi
+                        && bounds[k].minY <= bar.midY + 0.25 * h && bounds[k].maxY >= bar.midY - 0.25 * h
+                }
+            }
+            for s in nearby {
                 let b = bounds[s]
                 let isAbove = b.maxY <= bar.midY && b.maxY >= bar.minY - reach
                 let isBelow = b.minY >= bar.midY && b.minY <= bar.maxY + reach
                 guard isAbove || isBelow, b.maxX >= bar.minX - margin, b.minX <= bar.maxX + margin else { continue }
-                let inside = min(b.maxX, bar.maxX) - max(b.minX, bar.minX) >= 0.5 * max(b.width, 1)
+                // A numerator or denominator may overhang the bar's ends a little.
+                let inside = min(b.maxX, bar.maxX + overhang) - max(b.minX, bar.minX - overhang) >= 0.5 * max(b.width, 1)
                 // Writing continuing past the bar's ends means a line of text (underline), not a
                 // numerator or denominator. Flat strokes there ("=", "-") don't count.
-                let spills = !inside && b.height >= 0.4 * h
+                let spills = !inside && b.height >= 0.4 * h && !beyondExpression(s)
                 if isAbove {
                     if inside { above.append(s) } else if spills { aboveSpills = true }
                 } else {
@@ -472,14 +497,19 @@ private final class Analyzer {
             // actual edges are outside the gap. Test the sampled segments themselves.
             if graphics.query(strip).contains(where: { graphicIntersects($0, strip) }) { return true }
             guard width >= h else { return false }
-            let band = strip.insetBy(dx: -1.5 * h, dy: -3.5 * h)
-            let neighbours = grid.query(band).map { rects[$0] }.filter {
-                $0.intersects(band) && abs($0.midY - strip.midY) >= h
+            // Rows of the same column are close (line pitch ≤ 2.5h); rows further away are separate
+            // statements and say nothing about columns.
+            let pitch = 2.5 * h
+            let band = strip.insetBy(dx: -1.5 * h, dy: -(pitch + 2 * h))
+            let nearby = grid.query(band).map { rects[$0] }.filter { $0.intersects(band) }
+            let neighbours = nearby.filter {
+                let dy = abs($0.midY - strip.midY)
+                return dy >= h && dy <= pitch
             }
             let mid = strip.midX
             let margin = 0.25 * h
             let rightBank = neighbours.filter { $0.minX >= mid + margin }
-            let across = neighbours.filter { $0.minX < mid + margin && $0.maxX > mid - margin }
+            let across = nearby.filter { $0.minX < mid + margin && $0.maxX > mid - margin }
             return neighbours.contains { a in
                 a.maxX <= mid - margin
                     && !across.contains { $0.minY < a.midY + margin && $0.maxY > a.midY - margin }
@@ -487,15 +517,29 @@ private final class Analyzer {
             }
         }
 
+        // Words of one row may be far apart (text, then a formula further right); columns are told
+        // apart by `blocked` instead. Ink touching a drawing (an arrowhead, a label) only joins
+        // writing at word distance, so it stays with the drawing.
+        let wordGap = 3 * h, rowGap = 5 * h
+        var touching: [Int: Bool] = [:]
+        func touchesDrawing(_ k: Int) -> Bool {
+            if let known = touching[k] { return known }
+            let strokes = members[roots[k]]!
+            let touches = graphics.query(rects[k].insetBy(dx: -0.4 * h, dy: -0.4 * h))
+                .contains { distance(strokes, [$0]) <= 0.4 * h }
+            touching[k] = touches
+            return touches
+        }
         var lines = UnionFind(roots.count)
         for (a, ra) in rects.enumerated() {
-            for b in grid.query(ra.insetBy(dx: -3 * h, dy: 0)) where b > a {
+            for b in grid.query(ra.insetBy(dx: -rowGap, dy: 0)) where b > a {
                 let rb = rects[b]
                 let overlap = min(ra.maxY, rb.maxY) - max(ra.minY, rb.minY)
                 let shorter = max(min(ra.height, rb.height), 1)
                 let gapX = max(ra.minX, rb.minX) - min(ra.maxX, rb.maxX)
                 let centres = abs(ra.midY - rb.midY)
-                if overlap >= 0.4 * shorter, gapX <= 3 * h, centres <= 0.75 * max(ra.height, rb.height),
+                if overlap >= 0.4 * shorter, gapX <= rowGap, centres <= 0.75 * max(ra.height, rb.height),
+                   gapX <= wordGap || (!touchesDrawing(a) && !touchesDrawing(b)),
                    !(ra.minX < rb.minX ? blocked(ra, rb) : blocked(rb, ra)) {
                     lines.union(a, b)
                 }
@@ -635,11 +679,16 @@ private final class Analyzer {
         min(a.maxX, b.maxX) - max(a.minX, b.minX) >= 0.3 * min(a.width, b.width)
     }
 
+    /// Lines join a paragraph when they are close below one another and overlap horizontally.
+    /// Up to `gap` apart when they start at the same left margin; a line starting further left or
+    /// right (an indented or outdented new statement) only when it is tight below.
     func paragraphs(_ lines: [Line], gap: CGFloat) -> [[Line]] {
+        let tight = min(gap, 0.8 * h)
         var uf = UnionFind(lines.count)
         for (i, a) in lines.enumerated() {
             for (j, b) in lines.enumerated() where j != i {
-                if b.bounds.midY > a.bounds.midY, b.bounds.minY - a.bounds.maxY <= gap,
+                let aligned = abs(a.bounds.minX - b.bounds.minX) <= h
+                if b.bounds.midY > a.bounds.midY, b.bounds.minY - a.bounds.maxY <= (aligned ? gap : tight),
                    overlapsHorizontally(a.bounds, b.bounds) {
                     uf.union(i, j)
                 }

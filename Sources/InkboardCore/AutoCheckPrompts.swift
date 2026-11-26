@@ -56,7 +56,7 @@ public enum AutoCheckPrompts {
 
     /// First text of a page conversation.
     public static let conversationIntro = """
-        这是一个多轮对话，用来逐步检查同一页手写笔记里的各个块。每一轮我会发给你一个新写完的块、一个修改后的块，或标有红框与块号（如 B1、B2）的整页图片；红框和块号只是位置标记，不是笔记内容。前面各页的内容会以 Markdown 给出（块号写在各块前的 \(AutoCheckReply.blockComment("B1")) 注释里），当前页此前已检查的块也会附在上下文中。
+        这是一个多轮对话，用来逐步检查同一页手写笔记里的各个块。每一轮我会发给你一个新写完的块、一个修改后的块、从某个修改过的块起需要一起重新判断的若干块，或标有红框与块号（如 B1、B2）的整页图片；红框和块号只是位置标记，不是笔记内容。前面各页的内容会以 Markdown 给出（块号写在各块前的 \(AutoCheckReply.blockComment("B1")) 注释里），当前页此前已检查的块也会附在上下文中。
 
         \(rules)
 
@@ -68,8 +68,12 @@ public enum AutoCheckPrompts {
     /// Followed by the Markdown of the fixed pages before this one.
     public static let previousPagesHeading = "以下是已整理各页的笔记内容（按页顺序排列，各块前以注释标出块号）："
 
-    /// Followed by blocks of this page checked earlier, each as `blockLabel`, its image and `previousVerdict`.
+    /// Followed by blocks of this page checked earlier, each as `blockLabel`, its image and `previousVerdict`
+    /// (or `noVerdictNote` for a block edited since), in reading order.
     public static let checkedBlocksHeading = "以下是当前页之前已经检查过的块及其当时的检查结果（仅作上下文，除非后面明确要求重新检查，否则不要输出在结果里）："
+
+    /// After the image of a context block edited since its check (not re-checked yet): no verdict.
+    public static let noVerdictNote = "此块在上次检查后已修改，尚未重新检查，没有有效的检查结果；仅作上下文，不要输出在结果里。"
 
     /// Text right before a block image ("B3：").
     public static func blockLabel(_ tag: String) -> String { "\(tag)：" }
@@ -92,6 +96,14 @@ public enum AutoCheckPrompts {
         let laterList = tagList(other)
         let targets = tagList([tag] + other)
         return "块 \(tag) 已经修改或补充了内容，它之前的版本和检查结果全部作废。下面图片是 \(tag) 的最新内容。请根据新图片重新判断 \(tag)，并结合这一改动重新判断本对话中之前发过图片的后续块 \(laterList)（它们之前的检查结果也作废）。将 \(targets) 全部写入 JSON 的 blocks 数组并按上述格式输出："
+    }
+
+    /// Re-judges `tags` (reading order, from the first edited block of the page to its end): the
+    /// images follow, each after `blockLabel`. `changed`: the ones edited (or never checked) since.
+    public static func recheckFrom(_ tags: [String], changed: [String]) -> String {
+        let list = tagList(tags)
+        let edited = changed.isEmpty ? "" : "其中 \(tagList(changed)) 在上次检查后修改过或尚未检查；"
+        return "下面按阅读顺序给出当前页从 \(tags.first ?? "") 起各块的最新内容（每张图片前标有块号）。\(edited)这些块之前的检查结果全部作废（前面的块改了，后面的块的前提也可能随之改变）。请结合上文重新判断 \(list)，将它们全部写入 JSON 的 blocks 数组并按上述格式输出："
     }
 
     /// Checks every tagged block on the page image that follows; the page stays open.
