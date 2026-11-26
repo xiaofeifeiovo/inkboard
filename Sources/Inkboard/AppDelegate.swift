@@ -42,6 +42,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         CanvasView.showsBlocks.toggle()
     }
 
+    /// 转换 / 自动检查 menu → 自动重新检查改过的块 (applies to every window).
+    @objc func toggleAutoRecheck(_ sender: Any?) {
+        AutoRecheckSetting.isOn.toggle()
+    }
+
     /// Called at launch when no window was restored, and when the Dock icon is clicked with no windows open.
     func applicationShouldOpenUntitledFile(_ sender: NSApplication) -> Bool {
         !LegacyBoard.importIfPresent()
@@ -55,6 +60,9 @@ extension AppDelegate: NSMenuItemValidation {
         }
         if menuItem.action == #selector(toggleBlocks(_:)) {
             menuItem.state = CanvasView.showsBlocks ? .on : .off
+        }
+        if menuItem.action == #selector(toggleAutoRecheck(_:)) {
+            menuItem.state = AutoRecheckSetting.isOn ? .on : .off
         }
         return true
     }

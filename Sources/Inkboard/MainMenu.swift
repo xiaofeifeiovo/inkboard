@@ -94,6 +94,7 @@ enum MainMenu {
             menu.addItem(withTitle: "自动检查", action: #selector(MainWindowController.toggleAutoCheck(_:)), keyEquivalent: "")
             menu.addItem(withTitle: "检查最新的块", action: #selector(MainWindowController.checkLatestBlock(_:)), keyEquivalent: "k")
                 .keyEquivalentModifierMask = [.command, .shift]
+            menu.addItem(withTitle: AutoRecheckSetting.title, action: #selector(AppDelegate.toggleAutoRecheck(_:)), keyEquivalent: "")
             menu.addItem(.separator())
             menu.addItem(withTitle: "AI 设置…", action: #selector(AppDelegate.showSettings(_:)), keyEquivalent: "")
         }

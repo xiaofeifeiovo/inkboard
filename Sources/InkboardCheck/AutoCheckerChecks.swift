@@ -367,13 +367,15 @@ func runAutoCheckerChecks() async {
               "editing an older block sends nothing (only the block it interrupted)")
         check(writer.mark(containing: a[0])?.kind == .modifiedBox, "…its yellow box turns into a grey dashed box with 重新检查")
 
-        // 重新检查 on the open page: a recheck turn naming the later blocks.
+        // 重新检查 on the open page: a new conversation judges the page again from A (the first
+        // block) on; C, being written, is left out.
         checker.check(Set(a.map(\.id)))
         await checker.waitUntilIdle()
         let manual = service.turns.last ?? []
-        check(texts(manual).contains(AutoCheckPrompts.recheckBlock("B1", later: ["B2", "B3"])) && pngCount(manual) == 1,
-              "重新检查 on the current page re-sends the block and names the later ones")
-        check(service.conversationsOpened == 1, "…in the same conversation")
+        check(texts(manual).first == AutoCheckPrompts.conversationIntro
+              && texts(manual).contains(AutoCheckPrompts.recheckFrom(["B1", "B2"], changed: ["B1"])) && pngCount(manual) == 2,
+              "重新检查 on the current page re-judges the page from the edited block on (\(texts(manual).suffix(5)))")
+        check(service.conversationsOpened == 2, "…in a new conversation")
         check(writer.mark(containing: a[0])?.kind == .issue(.warning), "…and the box comes back with the new verdict")
 
         // ⇧⌘K: the block being written (C, grown since B3 was sent).
@@ -383,7 +385,8 @@ func runAutoCheckerChecks() async {
               "the block being written has no mark, and is reported as being written")
         check(checker.checkLatest(), "检查最新的块 sends the block being written")
         await checker.waitUntilIdle()
-        check(texts(service.turns.last ?? []).contains(AutoCheckPrompts.recheckBlock("B3", later: [])), "…as a re-check of B3")
+        check(texts(service.turns.last ?? []).contains(AutoCheckPrompts.checkBlock("B3")),
+              "…as B3, appended to the conversation of the re-check (which never saw B3)")
         check(!checker.checkLatest(), "…and does nothing once it is checked")
     }
 
@@ -513,6 +516,135 @@ func runAutoCheckerChecks() async {
         service.release()
         await checker.waitUntilIdle()
         check(writer.mark(containing: a[0])?.kind == .issue(.error), "…and the verdict brings the box back")
+        checker.shutdown()
+    }
+
+    // Edits in two checked blocks give each its own 重新检查: erasing the "=" turns the formula row
+    // into text, but the text row below starts at another margin and a moderate gap away, so the
+    // two don't become one paragraph (one unit, with one button under the last row).
+    do {
+        let service = FakeCheckService()
+        let checker = AutoChecker(service: service)
+        let writer = Writer(checker)
+        checker.setEnabled(true)
+        await checker.waitUntilIdle()
+        let equals = equalsSign(x: 101, axis: 33)
+        let formula = textLine(x: 60, baseline: 40, words: [3]) + equals + textLine(x: 121, baseline: 40, words: [3])
+        let text = textLine(x: 20, baseline: 76, words: [4, 3, 5])
+        let later = textLine(x: 20, baseline: 200, words: [3])
+        writer.write(formula + text + [later[0]])
+        await checker.waitUntilIdle()
+        check(checker.state.checks.map(\.tag) == ["B1", "B2"] && checker.marks.isEmpty,
+              "setup: a formula row and a text row below it are checked as two blocks")
+        let erased = Set(equals.map(\.id) + [text.last!.id])
+        writer.edit { $0.strokes.removeAll { erased.contains($0.id) } }
+        let rechecks = checker.marks.filter { $0.kind == .recheck }
+        check(rechecks.count == 2 && rechecks.map(\.tag) == ["B1", "B2"]
+              && writer.mark(containing: formula[0])?.ids.contains(text[0].id) == false,
+              "editing both rows gives each its own 重新检查 (\(rechecks.map { $0.tag ?? "-" }))")
+        checker.shutdown()
+    }
+
+    // The four ways a block reaches the AI (docs/auto-check.md §4.4–4.5), on one page.
+    do {
+        let service = FakeCheckService()
+        let checker = AutoChecker(service: service)
+        let writer = Writer(checker)
+        checker.setEnabled(true)
+        await checker.waitUntilIdle()
+        let lines = (0..<8).map(blockLine)
+        writer.write(lines[0] + lines[1] + lines[2] + lines[3] + [lines[4][0]])
+        await checker.waitUntilIdle()
+        check(checker.state.checks.map(\.tag) == ["B1", "B2", "B3", "B4"] && service.conversationsOpened == 1,
+              "setup: four blocks checked in one conversation")
+
+        // 1. Conversation alive, a new block: appended; an edited block stays as the AI saw it.
+        writer.edit { $0.strokes.removeAll { $0.id == lines[1].last!.id } }
+        writer.write(Array(lines[4].dropFirst()) + [lines[5][0]])
+        await checker.waitUntilIdle()
+        let appended = service.turns.last ?? []
+        check(service.conversationsOpened == 1 && texts(appended) == [AutoCheckPrompts.checkBlock("B5")] && pngCount(appended) == 1,
+              "a new block is appended to the open conversation, edited blocks are not re-sent")
+        check(writer.mark(containing: lines[1][0])?.kind == .recheck, "…and the edited block keeps its 重新检查")
+
+        // 2. Conversation lost, a new block: the context is rebuilt; the edited block is shown as
+        // it is now, without a verdict.
+        checker.settingsDidChange()
+        writer.write(Array(lines[5].dropFirst()) + [lines[6][0]])
+        await checker.waitUntilIdle()
+        let rebuilt = service.turns.last ?? []
+        check(service.conversationsOpened == 2 && texts(rebuilt).first == AutoCheckPrompts.conversationIntro
+              && texts(rebuilt).filter { $0 == AutoCheckPrompts.noVerdictNote }.count == 1
+              && texts(rebuilt).filter { $0.hasPrefix(AutoCheckPrompts.previousVerdict("")) }.count == 4
+              && texts(rebuilt).last == AutoCheckPrompts.checkBlock("B6") && pngCount(rebuilt) == 6,
+              "a rebuilt conversation shows the edited block without a verdict, then the new block")
+
+        // 3. Conversation alive, 重新检查: a new conversation; blocks before the first edited one are
+        // context with their verdicts, the rest of the page is judged in one turn.
+        writer.edit { $0.strokes.removeAll { $0.id == lines[3].last!.id } }
+        let fourth = Set(lines[3].dropLast().map(\.id))
+        checker.check(fourth)
+        await checker.waitUntilIdle()
+        let batch = service.turns.last ?? []
+        check(service.conversationsOpened == 3 && texts(batch).first == AutoCheckPrompts.conversationIntro
+              && texts(batch).contains(AutoCheckPrompts.blockLabel("B1")) && !texts(batch).contains(AutoCheckPrompts.noVerdictNote)
+              && texts(batch).contains(AutoCheckPrompts.recheckFrom(["B2", "B3", "B4", "B5", "B6"], changed: ["B2", "B4"]))
+              && pngCount(batch) == 6,
+              "重新检查 starts at the first edited block (B2), not at the one clicked, and judges the page to its end")
+        check(!texts(batch).contains(AutoCheckPrompts.blockLabel("B7")) && writer.isWriting(lines[6][0]),
+              "…leaving out the block being written")
+        check(checker.marks.isEmpty && checker.state.checks.count == 6, "…after which no block waits for 重新检查")
+
+        // 4. Conversation lost, 重新检查: the same.
+        writer.edit { $0.strokes.removeAll { $0.id == lines[4].last!.id } }
+        checker.settingsDidChange()
+        checker.check(Set(lines[4].dropLast().map(\.id)))
+        await checker.waitUntilIdle()
+        let again = service.turns.last ?? []
+        check(service.conversationsOpened == 4
+              && texts(again).filter { $0.hasPrefix(AutoCheckPrompts.previousVerdict("")) }.count == 4
+              && texts(again).contains(AutoCheckPrompts.recheckFrom(["B5", "B6"], changed: ["B5"])) && pngCount(again) == 6,
+              "after losing the conversation, 重新检查 rebuilds it the same way")
+        checker.shutdown()
+    }
+
+    // 自动重新检查: an edit is re-checked once it is finished (writing goes on in another block).
+    do {
+        let service = FakeCheckService()
+        let checker = AutoChecker(service: service)
+        let writer = Writer(checker)
+        checker.autoRecheck = true
+        checker.setEnabled(true)
+        await checker.waitUntilIdle()
+        let lines = (0..<4).map(blockLine)
+        writer.write(lines[0] + lines[1] + lines[2] + [lines[3][0]])
+        await checker.waitUntilIdle()
+        let sent = service.log.count
+
+        writer.edit { $0.strokes.removeAll { $0.id == lines[0].last!.id } }
+        await checker.waitUntilIdle()
+        check(service.log.count == sent && writer.mark(containing: lines[0][0])?.kind == .recheck,
+              "自动重新检查: erasing alone is not a finished edit (nothing sent yet)")
+        writer.write([lines[3][1]])
+        await checker.waitUntilIdle()
+        let erased = service.turns.last ?? []
+        check(service.log.count == sent + 1 && texts(erased).contains(AutoCheckPrompts.recheckFrom(["B1", "B2", "B3"], changed: ["B1"]))
+              && checker.marks.isEmpty,
+              "…writing in another block finishes it: the page is re-checked from it, context rebuilt")
+
+        // Rewriting inside a block: finished when writing moves on, not before. (Leaving the last
+        // line for it finishes that line, which is checked as a new block.)
+        let added = glyph(105, 120)
+        writer.write([added])
+        await checker.waitUntilIdle()
+        check(service.log.count == sent + 2 && texts(service.turns.last ?? []) == [AutoCheckPrompts.checkBlock("B4")]
+              && writer.isWriting(lines[1][0]), "…adding to an older block re-checks nothing while it is written")
+        writer.write([lines[3][2]])
+        await checker.waitUntilIdle()
+        check(service.log.count == sent + 3
+              && texts(service.turns.last ?? []).contains(AutoCheckPrompts.recheckFrom(["B2", "B3"], changed: ["B2"]))
+              && checker.state.check(tagged: "B2")?.ids.contains(added.id) == true,
+              "…and is re-checked once writing goes back to the other block")
         checker.shutdown()
     }
 
@@ -727,8 +859,8 @@ private func runSchedulerRegressionChecks() async {
         checker.load(board: board, state: AutoCheckState(enabled: true, checks: [receiver, donor], nextTag: 3))
         checker.check(aIDs)
         await checker.waitUntilIdle()
-        check(checker.state.check(tagged: "B1")?.ids == aIDs && checker.state.check(tagged: "B2") == donor,
-              "checking a block that gained one stroke preserves the donor block's previous verdict")
+        check(checker.state.check(tagged: "B1")?.ids == aIDs && checker.state.check(tagged: "B2")?.ids == bIDs,
+              "re-checking a block that gained one stroke re-judges the donor after it with its remaining strokes")
     }
 
     // Exercise both the independent fixed-page request and the last page's conversation turn.
@@ -790,9 +922,9 @@ private func runSchedulerRegressionChecks() async {
         service.issues = ["B2": warning, "B3": warning]
         checker.check(aIDs)
         await checker.waitUntilIdle()
-        check(service.conversationsOpened == 1 && checker.state.check(tagged: "B2")?.issues == warning
+        check(service.conversationsOpened == 2 && checker.state.check(tagged: "B2")?.issues == warning
               && checker.state.check(tagged: "B3")?.issues == warning,
-              "rechecking the first block twice in a rebuilt conversation updates both later verdicts")
+              "rechecking the first block twice (each time in a rebuilt conversation) updates both later verdicts")
     }
 
     do {

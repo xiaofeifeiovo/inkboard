@@ -244,3 +244,22 @@ enum AISettingsError: LocalizedError {
         }
     }
 }
+
+/// 自动重新检查 (a global preference, like 显示点格; off by default, since every re-check rebuilds
+/// the page's context). On: a block edited since its check is re-checked by itself once the edit is
+/// finished, i.e. when writing goes on in another block (`AutoChecker.autoRecheck`). Toggled from
+/// 转换 and the 自动检查 menu; every window follows `didChange`.
+enum AutoRecheckSetting {
+    static let key = "ai.check.autoRecheck"
+    static let didChange = Notification.Name("InkboardAutoRecheckDidChange")
+    static let title = "自动重新检查改过的块"
+
+    static var isOn: Bool {
+        get { UserDefaults.standard.bool(forKey: key) }
+        set {
+            guard newValue != isOn else { return }
+            UserDefaults.standard.set(newValue, forKey: key)
+            NotificationCenter.default.post(name: didChange, object: nil)
+        }
+    }
+}

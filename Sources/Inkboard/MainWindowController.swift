@@ -52,6 +52,7 @@ final class MainWindowController: NSWindowController {
     init(transcriber: HandwritingTranscriber, checkService: AutoCheckService) {
         self.transcriber = transcriber
         checker = AutoChecker(service: checkService, pageOptions: AISettings.current.pageOptions)
+        checker.autoRecheck = AutoRecheckSetting.isOn
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1200, height: 820),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
@@ -721,6 +722,13 @@ extension MainWindowController: NSPopoverDelegate, NSMenuDelegate {
         observers.append(NotificationCenter.default.addObserver(forName: LayoutSettings.didChange, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.checker.layoutDidChange() }
         })
+        observers.append(NotificationCenter.default.addObserver(forName: AutoRecheckSetting.didChange, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.checker.autoRecheck = AutoRecheckSetting.isOn
+                self.rebuildAutoCheckMenu()
+            }
+        })
         if let window {
             observers.append(NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: window, queue: .main) { [weak self] _ in
                 MainActor.assumeIsolated {
@@ -858,6 +866,7 @@ extension MainWindowController: NSPopoverDelegate, NSMenuDelegate {
         switch checker.stage {
         case .transcribingPage?: return "正在转写当前页"
         case .laterBlocks(let tags)?: return "正在重新判断后面的 \(tags.count) 个块"
+        case .recheck(let tags)?: return "正在从第一个改过的块起重新检查 \(tags.count) 个块"
         case .starting? where checking == 0: return "正在准备"
         default: return checking > 1 ? "正在检查 \(checking) 个块" : "正在检查 1 个块"
         }
@@ -914,6 +923,7 @@ extension MainWindowController: NSPopoverDelegate, NSMenuDelegate {
             switch stage {
             case .transcribingPage: info("正在转写并固定当前页…", indent: 1)
             case .laterBlocks(let tags): info("正在重新判断后面的 \(tags.count) 个块", indent: 1)
+            case .recheck(let tags): info("从第一个改过的块起重新检查 \(tags.count) 个块（已重建上下文）", indent: 1)
             case .starting where checking.isEmpty: info("正在准备…", indent: 1)
             default: break
             }
@@ -952,6 +962,10 @@ extension MainWindowController: NSPopoverDelegate, NSMenuDelegate {
         }
 
         menu.addItem(.separator())
+        let recheck = menu.addItem(withTitle: AutoRecheckSetting.title, action: #selector(AppDelegate.toggleAutoRecheck(_:)), keyEquivalent: "")
+        recheck.target = NSApp.delegate
+        recheck.state = AutoRecheckSetting.isOn ? .on : .off
+        recheck.toolTip = "改完一个已检查的块、开始在别处书写后，自动从当前页第一个改过的块起重新检查（会重建上下文，多用 token）"
         menu.addItem(withTitle: "关闭自动检查", action: #selector(toggleAutoCheck(_:)), keyEquivalent: "").target = self
     }
 
